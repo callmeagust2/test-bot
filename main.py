@@ -470,23 +470,29 @@ async def cmd_profile(message: Message):
     )
 
 
-# --- سیستم انتقال آتر (چند روشه) ---
+# ======================== بخش مدیریت و هوشمندسازی انتقال آتر ========================
 
 async def process_transfer_request(message: Message, state: FSMContext, to_user_id: int, amount: int):
-    """تابع کمکی برای شروع تأیید انتقال"""
+    """تابع عمومی برای برقراری مراحل اعتبار سنجی و دریافت تأییدیه پیش از انتقال"""
     from_user = message.from_user.id
     u = await get_user_data(from_user)
 
     if not u or u["is_frozen"]:
         return await message.reply("❌ حساب شما مسدود (فریز) است.")
-    if amount <= 0 or amount > MAX_BALANCE_LIMIT or to_user_id == from_user or u["balance"] < amount:
-        return await message.reply("❌ پارامترهای تراکنش یا موجودی نامعتبر است.")
+    if amount <= 0:
+        return await message.reply("❌ مبلغ وارد شده باید بزرگتر از صفر باشد.")
+    if amount > MAX_BALANCE_LIMIT:
+        return await message.reply("❌ مبلغ وارد شده از حد مجاز تراکنش فراتر است.")
+    if to_user_id == from_user:
+        return await message.reply("❌ امکان انتقال وجه به حساب خودتان وجود ندارد.")
+    if u["balance"] < amount:
+        return await message.reply("❌ موجودی حساب شما برای این انتقال کافی نیست.")
 
     target = await get_user_data(to_user_id)
     if not target:
-        return await message.reply("❌ کاربر مقصد در ربات عضویت ندارد.")
+        return await message.reply("❌ کاربر مقصد در دیتابیس ربات یافت نشد.")
     if target["balance"] + amount > MAX_BALANCE_LIMIT:
-        return await message.reply("❌ خطا: سقف گنجایش مقصد.")
+        return await message.reply("❌ خطا: سقف گنجایش حساب کاربر مقصد پر است.")
 
     target_name = target["full_name"] if target["full_name"] else str(to_user_id)
 
@@ -500,10 +506,10 @@ async def process_transfer_request(message: Message, state: FSMContext, to_user_
         ]]
     )
     await message.reply(
-        f"⚠️ تأییدیه انتقال آتر\n"
-        f"دریافت‌کننده: {target_name} (`{to_user_id}`)\n"
-        f"مبلغ: `₳ {amount}`\n"
-        f"آیا مطمئن هستید؟",
+        f"⚠️ **تأییدیه انتقال آتر**\n\n"
+        f"👤 دریافت‌کننده: **{target_name}** (`{to_user_id}`)\n"
+        f"💰 مبلغ: `₳ {amount}`\n\n"
+        f"آیا انتقال را تأیید می‌کنید؟",
         reply_markup=kb,
         parse_mode="Markdown",
     )
@@ -520,89 +526,122 @@ async def cmd_transfer(message: Message, state: FSMContext):
         return await message.reply("❌ حساب شما مسدود (فریز) است.")
 
     text = message.text.strip()
-    # حذف پیشوند
+    
+    # جداسازی دستور یا عبارت کلیدی
     if text.startswith("/transfer"):
         text = text[len("/transfer"):].strip()
     elif text.startswith("انتقال آتر"):
         text = text[len("انتقال آتر"):].strip()
 
-    # حالت ریپلای
+    # ۱. حالت ریپلای روی پیام فرد مقصد
     if message.reply_to_message and message.reply_to_message.from_user:
+        to_user_id = message.reply_to_message.from_user.id
+        if not text:
+            await state.update_data(to_user_id=to_user_id)
+            await message.reply("لطفاً مبلغ مورد نظر را وارد کنید:")
+            await state.set_state(TxForm.waiting_for_amount)
+            return
         try:
             amount = int(text)
-            to_user_id = message.reply_to_message.from_user.id
             return await process_transfer_request(message, state, to_user_id, amount)
         except ValueError:
-            return await message.reply("❌ مبلغ باید عدد باشد.")
+            return await message.reply("❌ مبلغ باید به صورت عددی وارد شود.")
 
+    # ۲. حالت دستور بدون آرگومان (/transfer یا انتقال آتر)
     parts = text.split()
     if len(parts) == 0:
-        # حالت تعاملی: اول شماره حساب بپرس
-        await message.reply("لطفاً شماره حساب (آیدی عددی) فرد مقصد را وارد کنید:")
+        await message.reply("لطفاً شماره حساب (آیدی عددی) یا نام کاربری (@username) فرد مقصد را وارد کنید:")
         await state.set_state(TxForm.waiting_for_to_user)
         return
 
+    # ۳. حالت کامل: داشتن دو پارامتر (مقصد + مبلغ)
     if len(parts) >= 2:
-        # حالت مستقیم: آیدی یا @یوزرنیم + مبلغ
         target_raw = parts[0]
         try:
             amount = int(parts[1])
         except ValueError:
-            return await message.reply("❌ مبلغ باید عدد باشد.")
+            return await message.reply("❌ مبلغ باید به صورت عدد وارد شود.")
 
         to_user_id = None
         if target_raw.startswith("@"):
-            # جستجو با یوزرنیم
-            username = target_raw[1:]
+            username = target_raw[1:].strip()
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
+                # جستجوی دقیق یا جستجوی استاندارد با کاراکترهای اسکیپ شده
                 async with db.execute(
-                    "SELECT user_id FROM users WHERE username = ? OR username = ?",
-                    (username, f"\\_{username}" if False else username),  # ساده
+                    "SELECT user_id FROM users WHERE username = ? OR username = ? OR username LIKE ?",
+                    (username, username.replace("_", "\\_"), f"%{username}%"),
                 ) as cur:
                     row = await cur.fetchone()
                     if row:
                         to_user_id = row["user_id"]
             if not to_user_id:
-                # تلاش ساده بدون escape
-                async with aiosqlite.connect(DB_PATH) as db:
-                    db.row_factory = aiosqlite.Row
-                    async with db.execute(
-                        "SELECT user_id FROM users WHERE username LIKE ?",
-                        (f"%{username}%",),
-                    ) as cur:
-                        row = await cur.fetchone()
-                        if row:
-                            to_user_id = row["user_id"]
-            if not to_user_id:
-                return await message.reply("❌ کاربری با این آیدی یافت نشد.")
+                return await message.reply("❌ کاربری با این آیدی کاربری (یوزرنیم) یافت نشد.")
         else:
             try:
                 to_user_id = int(target_raw)
             except ValueError:
-                return await message.reply("❌ شماره حساب باید عدد باشد.")
+                return await message.reply("❌ شماره حساب مقصد باید عدد یا یوزرنیم معتبر با @ باشد.")
 
         return await process_transfer_request(message, state, to_user_id, amount)
 
-    # اگر فقط یک قسمت بود، شاید آیدی باشد و بعد مبلغ بپرسد
-    try:
-        to_user_id = int(parts[0])
+    # ۴. حالت داشتن تنها یک پارامتر
+    target_raw = parts[0]
+    to_user_id = None
+
+    if target_raw.startswith("@"):
+        username = target_raw[1:].strip()
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT user_id FROM users WHERE username = ? OR username = ? OR username LIKE ?",
+                (username, username.replace("_", "\\_"), f"%{username}%"),
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    to_user_id = row["user_id"]
+        if not to_user_id:
+            return await message.reply("❌ کاربری با این آیدی کاربری (یوزرنیم) یافت نشد.")
         await state.update_data(to_user_id=to_user_id)
-        await message.reply("مبلغ را وارد کنید:")
+        await message.reply("مبلغ مورد نظر را وارد کنید:")
         await state.set_state(TxForm.waiting_for_amount)
-    except ValueError:
-        await message.reply("لطفاً شماره حساب (آیدی عددی) فرد مقصد را وارد کنید:")
-        await state.set_state(TxForm.waiting_for_to_user)
+    else:
+        try:
+            to_user_id = int(target_raw)
+            await state.update_data(to_user_id=to_user_id)
+            await message.reply("مبلغ مورد نظر را وارد کنید:")
+            await state.set_state(TxForm.waiting_for_amount)
+        except ValueError:
+            await message.reply("لطفاً شماره حساب (آیدی عددی) یا آیدی (@username) فرد مقصد را وارد کنید:")
+            await state.set_state(TxForm.waiting_for_to_user)
 
 
 @user_router.message(TxForm.waiting_for_to_user)
 async def process_to_user(message: Message, state: FSMContext):
-    try:
-        to_user_id = int(message.text.strip())
-    except ValueError:
-        return await message.reply("❌ شماره حساب باید عدد باشد. دوباره وارد کنید:")
+    target_raw = message.text.strip()
+    to_user_id = None
+
+    if target_raw.startswith("@"):
+        username = target_raw[1:].strip()
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT user_id FROM users WHERE username = ? OR username = ? OR username LIKE ?",
+                (username, username.replace("_", "\\_"), f"%{username}%"),
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    to_user_id = row["user_id"]
+        if not to_user_id:
+            return await message.reply("❌ کاربری با این نام کاربری یافت نشد. دوباره تلاش کنید:")
+    else:
+        try:
+            to_user_id = int(target_raw)
+        except ValueError:
+            return await message.reply("❌ شماره حساب باید عدد باشد یا با @ شروع شود. دوباره وارد کنید:")
+
     await state.update_data(to_user_id=to_user_id)
-    await message.reply("مبلغ را وارد کنید:")
+    await message.reply("مبلغ مورد نظر را وارد کنید:")
     await state.set_state(TxForm.waiting_for_amount)
 
 
@@ -616,7 +655,7 @@ async def process_amount(message: Message, state: FSMContext):
     to_user_id = data.get("to_user_id")
     if not to_user_id:
         await state.clear()
-        return await message.reply("❌ خطا. دوباره از اول شروع کنید.")
+        return await message.reply("❌ خطا در فرآیند. دوباره از ابتدا شروع کنید.")
     await process_transfer_request(message, state, to_user_id, amount)
 
 
@@ -624,7 +663,7 @@ async def process_amount(message: Message, state: FSMContext):
 async def confirm_transfer_cb(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     from_user = data.get("from_user") or callback.from_user.id
-    # فقط خود فرستنده بتواند تأیید کند
+
     if callback.from_user.id != from_user:
         return await callback.answer("❌ فقط انتقال‌دهنده می‌تواند تأیید کند.", show_alert=True)
 
@@ -684,14 +723,14 @@ async def confirm_transfer_cb(callback: CallbackQuery, state: FSMContext):
             await db.commit()
 
     await callback.message.edit_text(
-        f"✅ تراکنش با موفقیت انجام شد!\n"
-        f"به نام: **{target_name}**\n"
-        f"شناسه: `{tx_id}`\n"
-        f"مبلغ: `₳ {amount}`",
+        f"✅ تراکنش با موفقیت انجام شد!\n\n"
+        f"👤 به نام: **{target_name}**\n"
+        f"🔖 شناسه: `{tx_id}`\n"
+        f"💰 مبلغ: `₳ {amount}`",
         parse_mode="Markdown",
     )
 
-    # ارسال رسید خصوصی به هر دو طرف
+    # ارسال رسید اختصاصی برای هر دو طرف
     sender_data = await get_user_data(from_user)
     sender_name = sender_data["full_name"] if sender_data else str(from_user)
 
@@ -726,6 +765,8 @@ async def cancel_transfer_cb(callback: CallbackQuery, state: FSMContext):
         return await callback.answer("❌ فقط انتقال‌دهنده می‌تواند لغو کند.", show_alert=True)
     await state.clear()
     await callback.message.edit_text("❌ انتقال وجه لغو شد.")
+
+# ======================== پایان بخش هوشمندسازی انتقال ========================
 
 
 # --- بخش مدیریت و ادمین ---
@@ -840,7 +881,6 @@ async def cmd_create_group(message: Message):
     )
 
 
-# ======================== تغییر اصلی در اینجا ========================
 @admin_router.message(Command("add_group"))
 async def cmd_add_group(message: Message):
     if not is_private(message) or not await check_admin_filter(message):
@@ -874,10 +914,8 @@ async def cmd_add_group(message: Message):
             )
             await db.commit()
 
-    # ====== تغییر لینک با نام کاربری صحیح ======
-    bot_username = "BankofAtramentum_bot"  # نام کاربری واقعی ربات (با آندرسکور)
-    link = f"https://t.me/{bot_username}?start=G_{code}"
-    # =========================================
+    bot_info = await message.bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start=G_{code}"
 
     await message.reply(
         f"✅ **گروه مجازی «{g_name}»** با موفقیت در سیستم ربات ایجاد شد.\n\n"
@@ -886,7 +924,6 @@ async def cmd_add_group(message: Message):
         f"کاربران با کلیک روی لینک فوق، به این گروه در ربات ملحق میشوند.",
         parse_mode="Markdown"
     )
-# ======================== پایان تغییر ========================
 
 
 @admin_router.message(Command("extend_group"))
