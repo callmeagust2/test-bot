@@ -21,7 +21,7 @@ from aiogram.types import (
     Message,
 )
 import aiosqlite
-from aiohttp import web  # اضافه شده برای ایجاد Web Service در Render
+from aiohttp import web
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -30,7 +30,6 @@ logging.basicConfig(
 SUPER_ADMIN_1 = 8490505070
 SUPER_ADMIN_2 = 475473068  # ادمین دوم با دسترسی کامل
 
-# لیست سوپرادمین‌ها (از دیتابیس بارگذاری و به‌روزرسانی می‌شود)
 SUPER_ADMINS: set[int] = {SUPER_ADMIN_1, SUPER_ADMIN_2}
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -39,10 +38,8 @@ BACKUP_DIR = "backups"
 MAX_BALANCE_LIMIT = 1000000000  # سقف ۱ میلیارد آتر
 USERS_PER_PAGE = 5  # تعداد کاربران در هر صفحه پنل مدیریت
 
-# ⚙️ آیدی عددی کانال خصوصی بکاپ تلگرام شما
 BACKUP_CHANNEL_ID = -1003971216432
 
-# قفل هم‌روندی ناهمگام برای ایمن‌سازی تراکنش‌های مالی در برابر Race Condition
 db_lock = asyncio.Lock()
 
 
@@ -63,13 +60,12 @@ async def start_dummy_server():
 
 
 class TxForm(StatesGroup):
-    waiting_for_to_user = State()
-    waiting_for_amount = State()
     waiting_for_confirm = State()
 
 
 class AdminConfirmForm(StatesGroup):
     waiting_for_confirm = State()
+    waiting_for_reset_confirm = State()
 
 
 class AntiSpamMiddleware(BaseMiddleware):
@@ -138,26 +134,21 @@ async def init_db():
             )
         """)
 
-        # فقط گروه پیش‌فرض Default ثبت می‌شود
         for g in ["Default"]:
             await db.execute(
                 "INSERT OR IGNORE INTO groups (group_name) VALUES (?)", (g,)
             )
 
-        # ثبت سوپرادمین‌های پایه
         for sa_id in [SUPER_ADMIN_1, SUPER_ADMIN_2]:
             await db.execute(
                 "INSERT OR IGNORE INTO super_admins (user_id) VALUES (?)", (sa_id,)
             )
 
         await db.commit()
-
-        # بارگذاری لیست سوپرادمین‌ها از دیتابیس
         await load_super_admins(db)
 
 
 async def load_super_admins(db=None):
-    """بارگذاری لیست سوپرادمین‌ها از دیتابیس به متغیر سراسری"""
     global SUPER_ADMINS
     close_after = False
     if db is None:
@@ -167,7 +158,6 @@ async def load_super_admins(db=None):
         async with db.execute("SELECT user_id FROM super_admins") as cur:
             rows = await cur.fetchall()
             SUPER_ADMINS = {row[0] for row in rows}
-            # همیشه دو آیدی پایه را نگه دار
             SUPER_ADMINS.add(SUPER_ADMIN_1)
             SUPER_ADMINS.add(SUPER_ADMIN_2)
     finally:
@@ -228,7 +218,6 @@ def is_private(message: Message) -> bool:
     return message.chat.type == "private"
 
 
-# --- ایجاد پوشه بکاپ ---
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 
@@ -244,7 +233,6 @@ def create_zip_backup(prefix="manual"):
     return zip_path
 
 
-# --- سیستم بکاپ‌گیری و بازیابی خودکار تلگرامی ---
 async def restore_db_from_telegram(bot: Bot):
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
         logging.info("✅ فایل دیتابیس موجود است.")
@@ -265,7 +253,7 @@ async def restore_db_from_telegram(bot: Bot):
 
 async def auto_backup_loop(bot: Bot):
     while True:
-        await asyncio.sleep(3600)  # ارسال بکاپ خودکار هر ۱ ساعت
+        await asyncio.sleep(3600)
         if os.path.exists(DB_PATH):
             try:
                 await bot.send_document(
@@ -278,7 +266,6 @@ async def auto_backup_loop(bot: Bot):
                 logging.error(f"❌ خطا در ارسال بکاپ خودکار به تلگرام: {e}")
 
 
-# --- ساخت صفحه کاربران ---
 async def get_users_page(page: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -327,10 +314,8 @@ async def get_users_page(page: int):
 
 # --- دستورات کاربران ---
 
-
 @user_router.message(Command("start"))
 async def cmd_start(message: Message):
-    # فقط در چت خصوصی کار می‌کند
     if not is_private(message):
         return
 
@@ -338,7 +323,6 @@ async def cmd_start(message: Message):
     username = message.from_user.username
     full_name = message.from_user.full_name
 
-    # چک کنیم آیا کاربر قبلاً در دیتابیس بوده یا نه (برای تشخیص اولین بار)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
@@ -351,9 +335,7 @@ async def cmd_start(message: Message):
     if len(args) > 1:
         payload = args[1].strip()
 
-        # اگر payload با G شروع شود، آن را به عنوان کد دعوت در نظر بگیر
         if payload.upper().startswith("G"):
-            # پشتیبانی از هر دو فرمت: G_XXXX و GXXXX
             if payload.startswith("G_") or payload.startswith("g_"):
                 code = payload[2:].strip()
             else:
@@ -367,7 +349,6 @@ async def cmd_start(message: Message):
                     async with aiosqlite.connect(DB_PATH) as db:
                         db.row_factory = aiosqlite.Row
 
-                        # خواندن لینک (با و بدون ستون expires_at)
                         link_data = None
                         try:
                             async with db.execute(
@@ -388,14 +369,12 @@ async def cmd_start(message: Message):
                                     }
 
                         if not link_data:
-                            # برای دیباگ: کد استخراج‌شده را نشان بده
                             return await message.reply(
                                 f"❌ لینک دعوت نامعتبر است.\n"
                                 f"کد دریافتی: `{code}`",
                                 parse_mode="Markdown",
                             )
 
-                        # تبدیل به دیکشنری ساده برای دسترسی امن
                         if hasattr(link_data, "keys"):
                             group_name = link_data["group_name"]
                             expires_val = link_data["expires_at"] if "expires_at" in link_data.keys() else None
@@ -403,7 +382,6 @@ async def cmd_start(message: Message):
                             group_name = link_data.get("group_name")
                             expires_val = link_data.get("expires_at")
 
-                        # چک انقضا
                         if expires_val:
                             try:
                                 expires = datetime.fromisoformat(str(expires_val))
@@ -434,7 +412,6 @@ async def cmd_start(message: Message):
                     parse_mode="Markdown",
                 )
 
-    # اولین بار: خوش‌آمد + شماره حساب | دفعات بعد: فقط شماره حساب
     if not already_exists:
         await message.reply(
             f"به بانک جادویی Atramentum خوش اومدید.\n"
@@ -470,10 +447,9 @@ async def cmd_profile(message: Message):
     )
 
 
-# ======================== بخش مدیریت و هوشمندسازی انتقال آتر ========================
+# ======================== بخش انتقال آتر (اصلاح شده) ========================
 
 async def process_transfer_request(message: Message, state: FSMContext, to_user_id: int, amount: int):
-    """تابع عمومی برای برقراری مراحل اعتبار سنجی و دریافت تأییدیه پیش از انتقال"""
     from_user = message.from_user.id
     u = await get_user_data(from_user)
 
@@ -527,34 +503,39 @@ async def cmd_transfer(message: Message, state: FSMContext):
 
     text = message.text.strip()
     
-    # جداسازی دستور یا عبارت کلیدی
+    # جداسازی دستور
     if text.startswith("/transfer"):
         text = text[len("/transfer"):].strip()
     elif text.startswith("انتقال آتر"):
         text = text[len("انتقال آتر"):].strip()
 
-    # ۱. حالت ریپلای روی پیام فرد مقصد
+    # ۱. ریپلای روی پیام فرد مورد نظر
     if message.reply_to_message and message.reply_to_message.from_user:
         to_user_id = message.reply_to_message.from_user.id
         if not text:
-            await state.update_data(to_user_id=to_user_id)
-            await message.reply("لطفاً مبلغ مورد نظر را وارد کنید:")
-            await state.set_state(TxForm.waiting_for_amount)
-            return
+            return await message.reply("❌ لطفاً مبلغ را وارد کنید. مثال: `/transfer 1000` یا `انتقال آتر 1000`", parse_mode="Markdown")
         try:
             amount = int(text)
             return await process_transfer_request(message, state, to_user_id, amount)
         except ValueError:
             return await message.reply("❌ مبلغ باید به صورت عددی وارد شود.")
 
-    # ۲. حالت دستور بدون آرگومان (/transfer یا انتقال آتر)
+    # ۲. نمایش راهنما در صورت فرستادن کلمه خالی
     parts = text.split()
     if len(parts) == 0:
-        await message.reply("لطفاً شماره حساب (آیدی عددی) یا نام کاربری (@username) فرد مقصد را وارد کنید:")
-        await state.set_state(TxForm.waiting_for_to_user)
-        return
+        return await message.reply(
+            "🔄 **راهنمای انتقال آتر**\n\n"
+            "شما می‌توانید به یکی از روش‌های زیر انتقال را انجام دهید:\n\n"
+            "1️⃣ **با آیدی عددی:**\n"
+            "`/transfer 123456789 1000` یا `انتقال آتر 123456789 1000`\n\n"
+            "2️⃣ **با نام کاربری (یوزرنیم):**\n"
+            "`/transfer @username 1000` یا `انتقال آتر @username 1000`\n\n"
+            "3️⃣ **با ریپلای روی پیام شخص:**\n"
+            "روی پیام کاربر ریپلای کرده و بفرستید: `/transfer 1000` یا `انتقال آتر 1000`",
+            parse_mode="Markdown"
+        )
 
-    # ۳. حالت کامل: داشتن دو پارامتر (مقصد + مبلغ)
+    # ۳. انتقال مستقیم بر اساس فرمت مستقیم (آیدی/یوزرنیم + مبلغ)
     if len(parts) >= 2:
         target_raw = parts[0]
         try:
@@ -567,7 +548,6 @@ async def cmd_transfer(message: Message, state: FSMContext):
             username = target_raw[1:].strip()
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
-                # جستجوی دقیق یا جستجوی استاندارد با کاراکترهای اسکیپ شده
                 async with db.execute(
                     "SELECT user_id FROM users WHERE username = ? OR username = ? OR username LIKE ?",
                     (username, username.replace("_", "\\_"), f"%{username}%"),
@@ -585,78 +565,14 @@ async def cmd_transfer(message: Message, state: FSMContext):
 
         return await process_transfer_request(message, state, to_user_id, amount)
 
-    # ۴. حالت داشتن تنها یک پارامتر
-    target_raw = parts[0]
-    to_user_id = None
-
-    if target_raw.startswith("@"):
-        username = target_raw[1:].strip()
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT user_id FROM users WHERE username = ? OR username = ? OR username LIKE ?",
-                (username, username.replace("_", "\\_"), f"%{username}%"),
-            ) as cur:
-                row = await cur.fetchone()
-                if row:
-                    to_user_id = row["user_id"]
-        if not to_user_id:
-            return await message.reply("❌ کاربری با این آیدی کاربری (یوزرنیم) یافت نشد.")
-        await state.update_data(to_user_id=to_user_id)
-        await message.reply("مبلغ مورد نظر را وارد کنید:")
-        await state.set_state(TxForm.waiting_for_amount)
-    else:
-        try:
-            to_user_id = int(target_raw)
-            await state.update_data(to_user_id=to_user_id)
-            await message.reply("مبلغ مورد نظر را وارد کنید:")
-            await state.set_state(TxForm.waiting_for_amount)
-        except ValueError:
-            await message.reply("لطفاً شماره حساب (آیدی عددی) یا آیدی (@username) فرد مقصد را وارد کنید:")
-            await state.set_state(TxForm.waiting_for_to_user)
-
-
-@user_router.message(TxForm.waiting_for_to_user)
-async def process_to_user(message: Message, state: FSMContext):
-    target_raw = message.text.strip()
-    to_user_id = None
-
-    if target_raw.startswith("@"):
-        username = target_raw[1:].strip()
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT user_id FROM users WHERE username = ? OR username = ? OR username LIKE ?",
-                (username, username.replace("_", "\\_"), f"%{username}%"),
-            ) as cur:
-                row = await cur.fetchone()
-                if row:
-                    to_user_id = row["user_id"]
-        if not to_user_id:
-            return await message.reply("❌ کاربری با این نام کاربری یافت نشد. دوباره تلاش کنید:")
-    else:
-        try:
-            to_user_id = int(target_raw)
-        except ValueError:
-            return await message.reply("❌ شماره حساب باید عدد باشد یا با @ شروع شود. دوباره وارد کنید:")
-
-    await state.update_data(to_user_id=to_user_id)
-    await message.reply("مبلغ مورد نظر را وارد کنید:")
-    await state.set_state(TxForm.waiting_for_amount)
-
-
-@user_router.message(TxForm.waiting_for_amount)
-async def process_amount(message: Message, state: FSMContext):
-    try:
-        amount = int(message.text.strip())
-    except ValueError:
-        return await message.reply("❌ مبلغ باید عدد باشد. دوباره وارد کنید:")
-    data = await state.get_data()
-    to_user_id = data.get("to_user_id")
-    if not to_user_id:
-        await state.clear()
-        return await message.reply("❌ خطا در فرآیند. دوباره از ابتدا شروع کنید.")
-    await process_transfer_request(message, state, to_user_id, amount)
+    # در صورت عدم تطابق با الگوها، راهنما نمایش داده می‌شود
+    return await message.reply(
+        "❌ فرمت وارد شده صحیح نیست.\n\n"
+        "مثال‌ها:\n"
+        "`/transfer @username 1000`\n"
+        "`انتقال آتر 123456789 1000`",
+        parse_mode="Markdown"
+    )
 
 
 @user_router.callback_query(TxForm.waiting_for_confirm, F.data == "tx_yes")
@@ -730,7 +646,6 @@ async def confirm_transfer_cb(callback: CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
     )
 
-    # ارسال رسید اختصاصی برای هر دو طرف
     sender_data = await get_user_data(from_user)
     sender_name = sender_data["full_name"] if sender_data else str(from_user)
 
@@ -766,11 +681,8 @@ async def cancel_transfer_cb(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ انتقال وجه لغو شد.")
 
-# ======================== پایان بخش هوشمندسازی انتقال ========================
-
 
 # --- بخش مدیریت و ادمین ---
-
 
 @admin_router.message(Command("users"))
 async def cmd_users(message: Message):
@@ -797,7 +709,6 @@ async def cmd_users(message: Message):
             f"------------------------------\n"
         )
 
-    # اگر متن خیلی طولانی شد، به چند پیام تقسیم کن
     if len(text) > 4000:
         parts = []
         current = f"👥 **لیست تمام کاربران** (`{len(users)}` نفر)\n\n"
@@ -844,7 +755,6 @@ async def cb_users_noop(callback: CallbackQuery):
 
 @admin_router.message(Command("create_group"))
 async def cmd_create_group(message: Message):
-    """فقط گروه را به لیست اضافه می‌کند (بدون ساخت لینک)"""
     if not is_private(message) or not await check_admin_filter(message):
         return
 
@@ -948,7 +858,6 @@ async def cmd_extend_group(message: Message):
 
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
-            # پیدا کردن آخرین لینک این گروه
             cursor = await db.execute(
                 "SELECT code FROM group_links WHERE group_name = ? ORDER BY rowid DESC LIMIT 1",
                 (g_name,),
@@ -959,13 +868,11 @@ async def cmd_extend_group(message: Message):
 
             old_code = row[0]
 
-            # اگر ستون expires_at وجود ندارد اضافه کن
             try:
                 await db.execute("ALTER TABLE group_links ADD COLUMN expires_at TEXT")
             except Exception:
                 pass
 
-            # محاسبه تاریخ انقضای جدید (از الان + روزها)
             new_expires = (datetime.now(timezone.utc) + timedelta(days=extra_days)).isoformat()
             await db.execute(
                 "UPDATE group_links SET expires_at = ? WHERE code = ?",
@@ -1298,7 +1205,7 @@ async def admin_confirm_yes(callback: CallbackQuery, state: FSMContext):
                     f"📝 دلیل: {reason}\n"
                     f"🔖 شناسه: `{tx_id}`"
                 )
-            else:  # take
+            else:
                 if u["balance"] < amount:
                     return await callback.message.edit_text("❌ موجودی ناکافی.")
                 tx_id = f"TX-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{random.randint(100000, 999999)}"
@@ -1323,7 +1230,6 @@ async def admin_confirm_yes(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text(result_text, parse_mode="Markdown")
 
-    # اطلاع به سایر سوپرادمین‌ها
     for sa_id in SUPER_ADMINS:
         if sa_id != admin_id:
             try:
@@ -1340,6 +1246,59 @@ async def admin_confirm_no(callback: CallbackQuery, state: FSMContext):
         return await callback.answer("❌ فقط خودتان می‌توانید لغو کنید.", show_alert=True)
     await state.clear()
     await callback.message.edit_text("❌ عملیات لغو شد.")
+
+
+# ======================== دستور پاکسازی کامل (Reset All) ========================
+
+@admin_router.message(Command("reset_all"))
+async def cmd_reset_all(message: Message, state: FSMContext):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="⚠️ بله، همه‌چیز پاک شود", callback_data="confirm_reset_yes"),
+            InlineKeyboardButton(text="❌ انصراف", callback_data="confirm_reset_no"),
+        ]]
+    )
+    await message.reply(
+        "🚨 **هشدار جدی پاکسازی پایگاه داده!** 🚨\n\n"
+        "آیا مطمئن هستید که می‌خواهید **تمام داده‌های موجود در ربات** (شامل تمامی کاربران، موجودی‌ها، تراکنش‌ها، گروه‌ها و لینک‌ها) را به طور کامل و غیرقابل بازگشت پاک کنید؟\n\n"
+        "*(تنها لیست سوپرادمین‌های اصلی باقی خواهد ماند)*",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await state.set_state(AdminConfirmForm.waiting_for_reset_confirm)
+
+
+@admin_router.callback_query(AdminConfirmForm.waiting_for_reset_confirm, F.data == "confirm_reset_yes")
+async def process_reset_yes(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        return await callback.answer("❌ عدم دسترسی.", show_alert=True)
+
+    await state.clear()
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM users")
+            await db.execute("DELETE FROM audit_logs")
+            await db.execute("DELETE FROM groups")
+            await db.execute("DELETE FROM group_links")
+            await db.execute("INSERT OR IGNORE INTO groups (group_name) VALUES ('Default')")
+            await db.commit()
+
+    await callback.message.edit_text(
+        "🧹 **پاکسازی کامل با موفقیت انجام شد.**\n"
+        "تمامی اعضا، موجودی‌ها، تراکنش‌ها و گروه‌ها صفر شدند و ربات به حالت خام در آمد.",
+        parse_mode="Markdown"
+    )
+
+
+@admin_router.callback_query(AdminConfirmForm.waiting_for_reset_confirm, F.data == "confirm_reset_no")
+async def process_reset_no(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ عملیات پاکسازی لغو شد.")
+
+# ==============================================================================
 
 
 @admin_router.message(Command("rewardgroup"))
@@ -1551,14 +1510,12 @@ async def cmd_list_admins(message: Message):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
 
-    # سوپرادمین‌ها
     txt = "👑 **لیست سوپرادمین‌ها:**\n"
     for sa_id in sorted(SUPER_ADMINS):
         u = await get_user_data(sa_id)
         name = u["full_name"] if u else "ناشناس"
         txt += f"- **{name}** | `{sa_id}`\n"
 
-    # ادمین‌های معمولی
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -1599,7 +1556,6 @@ async def cmd_add_super(message: Message):
         await db.commit()
         await load_super_admins(db)
 
-    # همچنین ادمین معمولی هم بشود
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE users SET is_admin = 1 WHERE user_id = ?", (new_id,)
@@ -1690,7 +1646,6 @@ async def cmd_check(message: Message):
 
 # --- دستورات بکاپ‌گیری دستی و بازیابی ---
 
-
 @admin_router.message(Command("backup_now"))
 async def cmd_backup_now(message: Message):
     if not is_private(message) or not is_super_admin(message.from_user.id):
@@ -1767,7 +1722,6 @@ async def cmd_restore(message: Message):
 
 # --- راهنمای دستورات ---
 
-
 @user_router.message(Command("help"))
 @user_router.message(F.text == "راهنمای جامع بانک")
 async def cmd_help(message: Message):
@@ -1780,7 +1734,7 @@ async def cmd_help(message: Message):
         "📱 **راهنمای دستورات کاربران:**\n"
         "🔹 `/start` - شروع و دریافت شماره حساب\n"
         "🔹 `/profile` یا «پروفایل» - مشاهده نام، شماره حساب، موجودی و وضعیت\n"
-        "🔹 `/transfer` یا «انتقال آتر» - انتقال آتر (چند روش مختلف)\n\n"
+        "🔹 `/transfer` یا «انتقال آتر» - نمایش آموزش روش‌های انتقال\n\n"
     )
 
     if is_adm or is_sa:
@@ -1815,6 +1769,7 @@ async def cmd_help(message: Message):
             "🔸 `/delete_group [نام]` - حذف کامل گروه\n"
             "🔸 `/freeze [آیدی]` - فریز حساب\n"
             "🔸 `/unfreeze [آیدی]` - رفع فریز\n"
+            "🔸 `/reset_all` - **ریست و پاکسازی کامل تمامی داده‌های ربات**\n"
             "🔸 `/backup_now` - بکاپ ZIP\n"
             "🔸 `/force_backup` - ارسال بکاپ به کانال\n"
             "🔸 `/restore` - بازیابی (ریپلای روی فایل)\n"
@@ -1826,16 +1781,9 @@ async def cmd_help(message: Message):
 async def main():
     bot = Bot(token=BOT_TOKEN)
 
-    # ۱. روشن کردن وب‌سرور سبک اختصاصی برای پلن Web Service در Render
     await start_dummy_server()
-
-    # ۲. ابتدا دانلود خودکار آخرین بکاپ دیتابیس از کانال تلگرام
     await restore_db_from_telegram(bot)
-
-    # ۳. مقداردهی اولیه دیتابیس و جدول‌ها
     await init_db()
-
-    # ۴. شروع پروسه بکاپ‌گیری خودکار ۱ ساعته در پس‌زمینه
     asyncio.create_task(auto_backup_loop(bot))
 
     dp = Dispatcher(storage=MemoryStorage())
