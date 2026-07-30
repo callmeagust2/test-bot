@@ -840,7 +840,7 @@ async def cmd_create_group(message: Message):
     )
 
 
-# ======================== تغییر در اینجا ========================
+# ======================== تغییر اصلی در اینجا ========================
 @admin_router.message(Command("add_group"))
 async def cmd_add_group(message: Message):
     if not is_private(message) or not await check_admin_filter(message):
@@ -874,8 +874,10 @@ async def cmd_add_group(message: Message):
             )
             await db.commit()
 
-    bot_info = await message.bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=G_{code}"
+    # ====== تغییر لینک با نام کاربری صحیح ======
+    bot_username = "BankofAtramentum_bot"  # نام کاربری واقعی ربات (با آندرسکور)
+    link = f"https://t.me/{bot_username}?start=G_{code}"
+    # =========================================
 
     await message.reply(
         f"✅ **گروه مجازی «{g_name}»** با موفقیت در سیستم ربات ایجاد شد.\n\n"
@@ -1751,9 +1753,7 @@ async def cmd_help(message: Message):
             "🔹 `/groups` - لیست گروه‌ها\n"
             "🔹 `/group_users [نام]` - اعضای یک گروه\n"
             "🔹 `/create_group [نام]` - فقط اضافه کردن گروه (بدون لینک)\n"
-            # ======================== تغییر در اینجا ========================
             "🔹 `/add_group [نام]` - ساخت **گروه مجازی** + لینک دعوت یکتا (این گروه فقط درون ربات است)\n"
-            # ======================== پایان تغییر ========================
             "🔹 `/extend_group [نام] [روز]` - تمدید لینک فعلی\n"
             "🔹 `/renew_group [نام] [روز]` - ساخت لینک جدید با مدت اعتبار\n"
             "🔹 `/rename_group [قدیمی] [جدید]` - تغییر نام گروه\n"
