@@ -840,6 +840,7 @@ async def cmd_create_group(message: Message):
     )
 
 
+# ======================== تغییر در اینجا ========================
 @admin_router.message(Command("add_group"))
 async def cmd_add_group(message: Message):
     if not is_private(message) or not await check_admin_filter(message):
@@ -847,9 +848,17 @@ async def cmd_add_group(message: Message):
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        return await message.reply("راهنما: /add_group [نام_گروه]")
+        return await message.reply(
+            "⚠️ راهنما:\n"
+            "/add_group [نام_گروه_مجازی]\n\n"
+            "این دستور یک **گروه مجازی** درون ربات ایجاد میکند (نه یک گروه تلگرامی).\n"
+            "کاربران با استفاده از لینک تولیدشده میتوانند به این گروه در ربات بپیوندند."
+        )
 
     g_name = args[1].strip()
+    if not g_name:
+        return await message.reply("❌ نام گروه نمی‌تواند خالی باشد.")
+
     code = "".join(
         random.choices(string.ascii_uppercase + string.digits, k=10)
     )
@@ -869,10 +878,13 @@ async def cmd_add_group(message: Message):
     link = f"https://t.me/{bot_info.username}?start=G_{code}"
 
     await message.reply(
-        f"✅ گروه {g_name} با موفقیت ساخته شد.\n\n🔗 **لینک عضویت"
-        f" اختصاصی:**\n{link}",
-        parse_mode="Markdown",
+        f"✅ **گروه مجازی «{g_name}»** با موفقیت در سیستم ربات ایجاد شد.\n\n"
+        f"🔗 **لینک عضویت اختصاصی:**\n{link}\n\n"
+        f"📌 توجه: این گروه صرفاً یک برچسب درون ربات است و ارتباطی با گروه‌های تلگرام ندارد.\n"
+        f"کاربران با کلیک روی لینک فوق، به این گروه در ربات ملحق میشوند.",
+        parse_mode="Markdown"
     )
+# ======================== پایان تغییر ========================
 
 
 @admin_router.message(Command("extend_group"))
@@ -1739,7 +1751,9 @@ async def cmd_help(message: Message):
             "🔹 `/groups` - لیست گروه‌ها\n"
             "🔹 `/group_users [نام]` - اعضای یک گروه\n"
             "🔹 `/create_group [نام]` - فقط اضافه کردن گروه (بدون لینک)\n"
-            "🔹 `/add_group [نام]` - ساخت گروه + لینک دعوت یکتا\n"
+            # ======================== تغییر در اینجا ========================
+            "🔹 `/add_group [نام]` - ساخت **گروه مجازی** + لینک دعوت یکتا (این گروه فقط درون ربات است)\n"
+            # ======================== پایان تغییر ========================
             "🔹 `/extend_group [نام] [روز]` - تمدید لینک فعلی\n"
             "🔹 `/renew_group [نام] [روز]` - ساخت لینک جدید با مدت اعتبار\n"
             "🔹 `/rename_group [قدیمی] [جدید]` - تغییر نام گروه\n"
