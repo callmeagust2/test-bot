@@ -1858,6 +1858,68 @@ async def cmd_restore(message: Message):
 
 # --- ۱. دستورات سوپرادمین برای تنظیم نرخ‌ها و مدیریت نقش‌ها ---
 
+@admin_router.message(Command("list_shops"))
+async def cmd_list_shops(message: Message):
+    """دستور جدید 1: مشاهده لیست کامل فروشگاه‌ها"""
+    if not is_private(message) or not await check_admin_filter(message):
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT shop_id, owner_id, channel_id, channel_title, status FROM shops") as cur:
+            shops = await cur.fetchall()
+
+    if not shops:
+        return await message.reply("ℹ️ هیچ فروشگاهی در دیتابیس ثبت نشده است.")
+
+    txt = f"🏪 <b>لیست فروشگاه‌های ثبت‌شده</b> (<code>{len(shops)}</code> فروشگاه):\n\n"
+    for idx, s in enumerate(shops, start=1):
+        safe_title = html.escape(s['channel_title'] or 'بدون نام')
+        safe_ch_id = html.escape(str(s['channel_id']))
+        st_text = "✅ تایید شده" if s['status'] == "APPROVED" else "⏳ در انتظار تایید"
+        
+        txt += (
+            f"<b>{idx}. {safe_title}</b>\n"
+            f"🆔 شناسه فروشگاه: <code>{s['shop_id']}</code>\n"
+            f"👤 آیدی صاحب شاپ: <code>{s['owner_id']}</code>\n"
+            f"📢 کانال/گروه: <code>{safe_ch_id}</code>\n"
+            f"⚡ وضعیت: {st_text}\n"
+            f"------------------------------\n"
+        )
+        
+    await message.reply(txt, parse_mode="HTML")
+
+
+@admin_router.message(Command("list_couriers"))
+async def cmd_list_couriers(message: Message):
+    """دستور جدید 2: مشاهده لیست پستچی‌ها به همراه آیدی عددی آن‌ها"""
+    if not is_private(message) or not await check_admin_filter(message):
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT c.user_id, u.full_name, u.username FROM couriers c LEFT JOIN users u ON c.user_id = u.user_id"
+        ) as cur:
+            couriers = await cur.fetchall()
+
+    if not couriers:
+        return await message.reply("ℹ️ هیچ پستچی در سیستم ثبت نشده است.")
+
+    txt = f"🚚 <b>لیست پستچی‌های فعال</b> (<code>{len(couriers)}</code> نفر):\n\n"
+    for idx, c in enumerate(couriers, start=1):
+        safe_name = html.escape(c['full_name'] or 'ناشناس')
+        safe_uname = f"@{html.escape(c['username'])}" if c['username'] and c['username'] != "بدون آیدی" else "بدون یوزرنیم"
+        
+        txt += (
+            f"<b>{idx}. {safe_name}</b> ({safe_uname})\n"
+            f"🆔 آیدی عددی: <code>{c['user_id']}</code>\n"
+            f"------------------------------\n"
+        )
+
+    await message.reply(txt, parse_mode="HTML")
+
+
 @admin_router.message(Command("set_shop_rates"))
 async def cmd_set_shop_rates(message: Message):
     if not is_private(message) or not is_super_admin(message.from_user.id):
@@ -2573,7 +2635,9 @@ async def cmd_help(message: Message):
             "🔹 <code>/renew_group [نام] [روز]</code> - ساخت لینک جدید با مدت اعتبار\n"
             "🔹 <code>/rename_group [قدیمی] [جدید]</code> - تغییر نام گروه\n"
             "🔹 <code>/move_group [آیدی] [گروه]</code> - تغییر گروه کاربر\n"
-            "🔹 <code>/remove_group [آیدی]</code> - برگرداندن به Default\n\n"
+            "🔹 <code>/remove_group [آیدی]</code> - برگرداندن به Default\n"
+            "🔹 <code>/list_shops</code> - مشاهده لیست کامل فروشگاه‌ها\n"
+            "🔹 <code>/list_couriers</code> - مشاهده لیست تمام پستچی‌ها و آیدی عددی آن‌ها\n\n"
         )
 
     if is_sa:
@@ -2583,48 +2647,60 @@ async def cmd_help(message: Message):
             "🔸 <code>/set_courier_rates</code> - تنظیم درصدهای پستی و بازه‌ها\n"
             "🔸 <code>/shop_requests</code> - بررسی درخواست‌های فروشگاه جدید\n"
             "🔸 <code>/remove_shop [آیدی]</code> - حذف یا لغو مجوز فروشگاه\n"
-            "🔸 <code>/add_courier [آیدی]</code> - افزودن پستچی مجاز\n"
-            "🔸 <code>/remove_courier [آیدی]</code> - عزل پستچی\n"
-            "🔸 <code>/give [آیدی] [مقدار]</code> - واریز (با تأیید دو مرحله‌ای)\n"
-            "🔸 <code>/take [آیدی] [مقدار]</code> - کسر (با تأیید دو مرحله‌ای)\n"
-            "🔸 <code>/rewardgroup [گروه] [مقدار]</code> - پاداش گروهی\n"
-            "🔸 <code>/undo [شناسه]</code> - برگشت تراکنش\n"
-            "🔸 <code>/economy</code> - آمار اقتصاد\n"
-            "🔸 <code>/check [آیدی]</code> - اطلاعات کامل کاربر\n"
-            "🔸 <code>/promote [آیدی]</code> - ارتقا به ادمین\n"
-            "🔸 <code>/demote [آیدی]</code> - عزل ادمین\n"
-            "🔸 <code>/list_admins</code> - مشاهده لیست ادمین‌ها و سوپرادمین‌ها\n"
-            "🔸 <code>/add_super [آیدی]</code> - اضافه کردن سوپرادمین جدید\n"
-            "🔸 <code>/remove_super [آیدی]</code> - حذف سوپرادمین\n"
-            "🔸 <code>/delete_group [نام]</code> - حذف کامل گروه\n"
-            "🔸 <code>/freeze [آیدی]</code> - فریز حساب\n"
-            "🔸 <code>/unfreeze [آیدی]</code> - رفع فریز\n"
-            "🔸 <code>/backup_now</code> - بکاپ ZIP\n"
-            "🔸 <code>/force_backup</code> - ارسال بکاپ به کانال\n"
-            "🔸 <code>/restore</code> - بازیابی (ریپلای روی فایل)\n"
-            "🔸 <code>/reset_all</code> - پاکسازی کامل دیتابیس و ری‌ست ربات\n"
+            "🔸 <code>/add_courier [آیدی]</code> - افزودن پستچی جدید\n"
+            "🔸 <code>/remove_courier [آیدی]</code> - حذف پستچی\n"
+            "🔸 <code>/give [آیدی] [مقدار]</code> - واریز آتر\n"
+            "🔸 <code>/take [آیدی] [مقدار]</code> - کسر آتر\n"
+            "🔸 <code>/rewardgroup [گروه] [مقدار]</code> - واریز همگانی به یک گروه\n"
+            "🔸 <code>/undo [شناسه_تراکنش]</code> - لغو و برگشت تراکنش\n"
+            "🔸 <code>/freeze [آیدی]</code> / <code>/unfreeze [آیدی]</code> - مسدود/فعال‌سازی\n"
+            "🔸 <code>/promote [آیدی]</code> / <code>/demote [آیدی]</code> - ارتقا/سلب ادمین\n"
+            "🔸 <code>/add_super [آیدی]</code> / <code>/remove_super [آیدی]</code> - مدیریت سوپرادمین‌ها\n"
+            "🔸 <code>/list_admins</code> - لیست ادمین‌ها و سوپرادمین‌ها\n"
+            "🔸 <code>/check [آیدی]</code> - مشاهده اطلاعات کامل حساب\n"
+            "🔸 <code>/economy</code> - آمار کل نقدینگی\n"
+            "🔸 <code>/backup_now</code> - دانلود بکاپ Zip دیتابیس\n"
+            "🔸 <code>/force_backup</code> - ارسال فایل دیتابیس به کانال تلگرام\n"
+            "🔸 <code>/restore</code> - بازیابی دیتابیس (با ریپلای روی فایل)\n"
+            "🔸 <code>/reset_all</code> - صفر کردن کاملاً دائم دیتابیس\n"
         )
 
     await message.reply(txt, parse_mode="HTML")
 
 
+# --- نقطه شروع ربات ---
+
+
 async def main():
-    bot = Bot(token=BOT_TOKEN)
+    if not BOT_TOKEN:
+        logging.error("❌ BOT_TOKEN یافت نشد! لطفا آن را در فایل .env یا Environment Variables تنظیم کنید.")
+        return
 
+    # اجرای وب سرور جهت ساخت Web Service در حالت Dummy
     await start_dummy_server()
-    await restore_db_from_telegram(bot)
-    await init_db()
 
-    asyncio.create_task(auto_backup_loop(bot))
-
+    bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
+    # بازیابی دیتابیس از تلگرام در صورت نیازمندی سرور (مثل Render بعد از ری‌استارت)
+    await restore_db_from_telegram(bot)
+
+    # ایجاد جداول دیتابیس
+    await init_db()
+
+    dp.include_router(user_router)
     dp.include_router(admin_router)
     dp.include_router(shop_router)
-    dp.include_router(user_router)
 
+    # شروع حلقه بکاپ‌گیری خودکار تلگرامی
+    asyncio.create_task(auto_backup_loop(bot))
+
+    logging.info("🚀 ربات بانک آتر با موفقیت روشن شد و آماده پردازش است.")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("🛑 ربات خاموش شد.")
