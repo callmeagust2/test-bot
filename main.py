@@ -24,6 +24,8 @@ from aiogram.types import (
 import aiosqlite
 from aiohttp import web  # اضافه شده برای ایجاد Web Service در Render
 
+from shop import shop_router  # <--- اضافه شده در گام ۲
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -1836,6 +1838,7 @@ async def main():
 
     dp.include_router(admin_router)
     dp.include_router(user_router)
+    dp.include_router(shop_router)  # <--- اضافه شده در گام ۲
 
     await dp.start_polling(bot)
 
