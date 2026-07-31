@@ -22,7 +22,7 @@ from aiogram.types import (
     Message,
 )
 import aiosqlite
-from aiohttp import web
+from aiohttp import web  # اضافه شده برای ایجاد Web Service در Render
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -31,6 +31,7 @@ logging.basicConfig(
 SUPER_ADMIN_1 = 8490505070
 SUPER_ADMIN_2 = 475473068  # ادمین دوم با دسترسی کامل
 
+# لیست سوپرادمین‌ها (از دیتابیس بارگذاری و به‌روزرسانی می‌شود)
 SUPER_ADMINS: set[int] = {SUPER_ADMIN_1, SUPER_ADMIN_2}
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -39,8 +40,10 @@ BACKUP_DIR = "backups"
 MAX_BALANCE_LIMIT = 1000000000  # سقف ۱ میلیارد آتر
 USERS_PER_PAGE = 5  # تعداد کاربران در هر صفحه پنل مدیریت
 
+# ⚙️ آیدی عددی کانال خصوصی بکاپ تلگرام شما
 BACKUP_CHANNEL_ID = -1003971216432
 
+# قفل هم‌روندی ناهمگام برای ایمن‌سازی تراکنش‌های مالی در برابر Race Condition
 db_lock = asyncio.Lock()
 
 
@@ -68,17 +71,6 @@ class TxForm(StatesGroup):
 
 class AdminConfirmForm(StatesGroup):
     waiting_for_confirm = State()
-
-
-class AddProductForm(StatesGroup):
-    waiting_for_shop_id = State()
-    waiting_for_title = State()
-    waiting_for_desc = State()
-    waiting_for_price = State()
-    waiting_for_needs_shipping = State()
-    waiting_for_stock_type = State()
-    waiting_for_stock_count = State()
-    waiting_for_photo = State()
 
 
 class AntiSpamMiddleware(BaseMiddleware):
@@ -116,12 +108,6 @@ async def init_db():
                 group_name TEXT DEFAULT 'Default'
             )
         """)
-        
-        await db.execute("""
-            INSERT OR IGNORE INTO users (user_id, username, full_name, balance)
-            VALUES (0, 'central_treasury', 'خزانه بانک مرکزی', 0)
-        """)
-
         await db.execute("""
             CREATE TABLE IF NOT EXISTS audit_logs (
                 tx_id TEXT PRIMARY KEY,
@@ -153,114 +139,26 @@ async def init_db():
             )
         """)
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS shop_settings (
-                key TEXT PRIMARY KEY,
-                value INTEGER
-            )
-        """)
-        # درصد‌های پیش‌فرض سیستم شاپ
-        await db.execute("INSERT OR IGNORE INTO shop_settings (key, value) VALUES ('seller_pct', 51)")
-        await db.execute("INSERT OR IGNORE INTO shop_settings (key, value) VALUES ('treasury_pct', 40)")
-        await db.execute("INSERT OR IGNORE INTO shop_settings (key, value) VALUES ('tax_pct', 9)")
-
-        # درصد‌های پیش‌فرض سیستم پستچی
-        await db.execute("INSERT OR IGNORE INTO shop_settings (key, value) VALUES ('courier_pct', 70)")
-        await db.execute("INSERT OR IGNORE INTO shop_settings (key, value) VALUES ('courier_treasury_pct', 20)")
-        await db.execute("INSERT OR IGNORE INTO shop_settings (key, value) VALUES ('courier_tax_pct', 10)")
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS shops (
-                shop_id TEXT PRIMARY KEY,
-                owner_id INTEGER,
-                shop_name TEXT,
-                status TEXT DEFAULT 'PENDING'
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                product_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                shop_id TEXT,
-                title TEXT,
-                description TEXT,
-                price INTEGER,
-                stock_type TEXT DEFAULT 'UNLIMITED',
-                stock_count INTEGER DEFAULT 0,
-                photo_id TEXT,
-                needs_shipping INTEGER DEFAULT 0,
-                shipping_price INTEGER DEFAULT 0
-            )
-        """)
-
-        try:
-            await db.execute("ALTER TABLE products ADD COLUMN needs_shipping INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE products ADD COLUMN shipping_price INTEGER DEFAULT 0")
-        except Exception:
-            pass
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
-                order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                shop_id TEXT,
-                product_id INTEGER,
-                amount INTEGER,
-                status TEXT DEFAULT 'DELIVERED',
-                created_at TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS couriers (
-                user_id INTEGER PRIMARY KEY
-            )
-        """)
-
+        # فقط گروه پیش‌فرض Default ثبت می‌شود
         for g in ["Default"]:
             await db.execute(
                 "INSERT OR IGNORE INTO groups (group_name) VALUES (?)", (g,)
             )
 
+        # ثبت سوپرادمین‌های پایه
         for sa_id in [SUPER_ADMIN_1, SUPER_ADMIN_2]:
             await db.execute(
                 "INSERT OR IGNORE INTO super_admins (user_id) VALUES (?)", (sa_id,)
             )
 
         await db.commit()
+
+        # بارگذاری لیست سوپرادمین‌ها از دیتابیس
         await load_super_admins(db)
 
 
-async def get_shop_rates():
-    """دریافت درصد‌های تنظیم‌شده شاپ از دیتابیس"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT key, value FROM shop_settings") as cur:
-            rows = await cur.fetchall()
-            rates = {row["key"]: row["value"] for row in rows}
-            return (
-                rates.get("seller_pct", 51),
-                rates.get("treasury_pct", 40),
-                rates.get("tax_pct", 9)
-            )
-
-
-async def get_courier_rates():
-    """دریافت درصد‌های تنظیم‌شده پستچی از دیتابیس"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT key, value FROM shop_settings") as cur:
-            rows = await cur.fetchall()
-            rates = {row["key"]: row["value"] for row in rows}
-            return (
-                rates.get("courier_pct", 70),
-                rates.get("courier_treasury_pct", 20),
-                rates.get("courier_tax_pct", 10)
-            )
-
-
 async def load_super_admins(db=None):
+    """بارگذاری لیست سوپرادمین‌ها از دیتابیس به متغیر سراسری"""
     global SUPER_ADMINS
     close_after = False
     if db is None:
@@ -270,6 +168,7 @@ async def load_super_admins(db=None):
         async with db.execute("SELECT user_id FROM super_admins") as cur:
             rows = await cur.fetchall()
             SUPER_ADMINS = {row[0] for row in rows}
+            # همیشه دو آیدی پایه را نگه دار
             SUPER_ADMINS.add(SUPER_ADMIN_1)
             SUPER_ADMINS.add(SUPER_ADMIN_2)
     finally:
@@ -304,10 +203,7 @@ async def get_user_data(user_id: int):
 
 user_router = Router()
 admin_router = Router()
-shop_router = Router()
-
 user_router.message.middleware(AntiSpamMiddleware())
-shop_router.message.middleware(AntiSpamMiddleware())
 
 
 async def check_admin_filter(message: Message) -> bool:
@@ -325,6 +221,7 @@ def is_private(message: Message) -> bool:
     return message.chat.type == "private"
 
 
+# --- ایجاد پوشه بکاپ ---
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 
@@ -340,6 +237,7 @@ def create_zip_backup(prefix="manual"):
     return zip_path
 
 
+# --- سیستم بکاپ‌گیری و بازیابی خودکار تلگرامی ---
 async def restore_db_from_telegram(bot: Bot):
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
         logging.info("✅ فایل دیتابیس موجود است.")
@@ -360,7 +258,7 @@ async def restore_db_from_telegram(bot: Bot):
 
 async def auto_backup_loop(bot: Bot):
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(3600)  # ارسال بکاپ خودکار هر ۱ ساعت
         if os.path.exists(DB_PATH):
             try:
                 await bot.send_document(
@@ -374,6 +272,7 @@ async def auto_backup_loop(bot: Bot):
                 logging.error(f"❌ خطا در ارسال بکاپ خودکار به تلگرام: {e}")
 
 
+# --- ساخت صفحه کاربران ---
 async def get_users_page(page: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -424,6 +323,7 @@ async def get_users_page(page: int):
 
 # --- دستورات کاربران ---
 
+
 @user_router.message(Command("start"))
 async def cmd_start(message: Message):
     if not is_private(message):
@@ -444,44 +344,6 @@ async def cmd_start(message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) > 1:
         payload = args[1].strip()
-
-        if payload.upper().startswith("BUY_"):
-            p_id_str = payload[4:].strip()
-            if p_id_str.isdigit():
-                product_id = int(p_id_str)
-                async with aiosqlite.connect(DB_PATH) as db:
-                    db.row_factory = aiosqlite.Row
-                    async with db.execute("""
-                        SELECT p.*, s.shop_name 
-                        FROM products p 
-                        JOIN shops s ON p.shop_id = s.shop_id 
-                        WHERE p.product_id = ? AND s.status = 'APPROVED'
-                    """, (product_id,)) as cur:
-                        product = await cur.fetchone()
-
-                if not product:
-                    return await message.reply("❌ کالای موردنظر یافت نشد یا فروشگاه مربوطه فعال نیست.")
-
-                kb = InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="🛒 تایید و خرید محصول", callback_data=f"confirm_buy_{product_id}")
-                ]])
-
-                ship_text = "نیازمند پست 🚚" if product["needs_shipping"] else "بدون نیاز به پست"
-                stock_text = "نامحدود" if product["stock_type"] == "UNLIMITED" else f"{product['stock_count']} عدد"
-
-                caption = (
-                    f"🛒 <b>{html.escape(product['title'])}</b>\n\n"
-                    f"🏪 فروشگاه: <b>{html.escape(product['shop_name'])}</b>\n"
-                    f"📝 توضیحات: {html.escape(product['description'] or 'ندارد')}\n"
-                    f"💰 قیمت کالا: <code>₳ {product['price']:,}</code>\n"
-                    f"📦 موجودی: <b>{stock_text}</b>\n"
-                    f"🚚 وضعیت ارسال: {ship_text}\n"
-                )
-
-                if product["photo_id"]:
-                    return await message.reply_photo(photo=product["photo_id"], caption=caption, reply_markup=kb, parse_mode="HTML")
-                else:
-                    return await message.reply(caption, reply_markup=kb, parse_mode="HTML")
 
         if payload.upper().startswith("G"):
             if payload.startswith("G_") or payload.startswith("g_"):
@@ -601,9 +463,10 @@ async def cmd_profile(message: Message):
     )
 
 
-# --- سیستم انتقال آتر ---
+# --- سیستم انتقال آتر (چند روشه) ---
 
 async def process_transfer_request(message: Message, state: FSMContext, to_user_id: int, amount: int):
+    """تابع کمکی برای شروع تأیید انتقال"""
     from_user = message.from_user.id
     u = await get_user_data(from_user)
 
@@ -852,712 +715,8 @@ async def cancel_transfer_cb(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("❌ انتقال وجه لغو شد.")
 
 
-# ==========================================
-# 🛍️ بخش شاپ و خریدهای کاربران
-# ==========================================
+# --- بخش مدیریت و ادمین ---
 
-@shop_router.message(Command("my_orders"))
-@shop_router.message(Command("my_purchases"))
-@shop_router.message(F.text == "خریدهای من")
-async def cmd_my_orders(message: Message):
-    if not is_private(message):
-        return
-    user_id = message.from_user.id
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
-            SELECT o.order_id, o.amount, o.status, o.created_at, p.title, s.shop_name
-            FROM orders o
-            LEFT JOIN products p ON o.product_id = p.product_id
-            LEFT JOIN shops s ON o.shop_id = s.shop_id
-            WHERE o.user_id = ?
-            ORDER BY o.order_id DESC
-        """, (user_id,)) as cur:
-            orders = await cur.fetchall()
-
-    if not orders:
-        return await message.reply("🛍️ شما هنوز هیچ خریدی انجام نداده‌اید.")
-
-    txt = "📦 <b>لیست اجناس خریده‌شده و دست‌رسیده:</b>\n\n"
-    for o in orders:
-        product_title = html.escape(o["title"] or "محصول حذف‌شده")
-        shop_name = html.escape(o["shop_name"] or "فروشگاه ناپیدا")
-        status_text = "✅ به دستتان رسیده" if o["status"] in ["DELIVERED", "COMPLETED"] else "⏳ در حال ارسال"
-        try:
-            dt = datetime.fromisoformat(o["created_at"]).strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            dt = o["created_at"]
-        
-        txt += (
-            f"🔹 <b>{product_title}</b>\n"
-            f"🏪 فروشگاه: {shop_name}\n"
-            f"💰 قیمت خرید: <code>₳ {o['amount']:,}</code>\n"
-            f"📅 تاریخ: <code>{dt}</code>\n"
-            f"📌 وضعیت: {status_text}\n"
-            f"------------------------------\n"
-        )
-    await message.reply(txt, parse_mode="HTML")
-
-
-@shop_router.message(Command("register_shop"))
-async def cmd_register_shop(message: Message):
-    if not is_private(message):
-        return
-
-    text_params = message.text.strip()[len("/register_shop"):].strip()
-    if not text_params:
-        return await message.reply(
-            "❌ <b>نحوه ثبت فروشگاه:</b>\n"
-            "<code>/register_shop (نام فروشگاه) (شناسه)</code>\n\n"
-            "مثال: <code>/register_shop فروشگاه دیجیتال tech_store</code>",
-            parse_mode="HTML"
-        )
-
-    parts = text_params.rsplit(maxsplit=1)
-    if len(parts) < 2:
-        return await message.reply(
-            "❌ لطفاً هم نام فروشگاه و هم شناسه را وارد کنید.\n"
-            "مثال: <code>/register_shop فروشگاه دیجیتال tech_store</code>",
-            parse_mode="HTML"
-        )
-
-    shop_name, shop_id = parts[0].strip(), parts[1].lower().strip()
-
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT 1 FROM shops WHERE shop_id = ?", (shop_id,)) as cur:
-                if await cur.fetchone():
-                    return await message.reply("❌ این شناسه شاپ قبلاً ثبت شده است.")
-
-            await db.execute(
-                "INSERT INTO shops (shop_id, owner_id, shop_name, status) VALUES (?, ?, ?, 'PENDING')",
-                (shop_id, message.from_user.id, shop_name)
-            )
-            await db.commit()
-
-    await message.reply(
-        f"✅ درخواست ثبت فروشگاه «<b>{html.escape(shop_name)}</b>» ارسال شد و پس از تأیید ادمین فعال خواهد شد.",
-        parse_mode="HTML"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ تأیید شاپ", callback_data=f"approve_shop:{shop_id}"),
-        InlineKeyboardButton(text="❌ رد شاپ", callback_data=f"reject_shop:{shop_id}")
-    ]])
-
-    for sa_id in SUPER_ADMINS:
-        try:
-            await message.bot.send_message(
-                sa_id,
-                f"🏪 <b>درخواست ساخت فروشگاه جدید!</b>\n\n"
-                f"👤 فروشنده: <code>{message.from_user.id}</code>\n"
-                f"🆔 شناسه شاپ: <code>{shop_id}</code>\n"
-                f"🏷 نام شاپ: <b>{html.escape(shop_name)}</b>",
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-
-@shop_router.callback_query(F.data.startswith("approve_shop:"))
-async def cb_approve_shop(callback: CallbackQuery):
-    if not is_super_admin(callback.from_user.id):
-        return await callback.answer("❌ فقط سوپرادمین می‌تواند این عملیات را انجام دهد.", show_alert=True)
-
-    shop_id = callback.data.split(":")[1]
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT owner_id, shop_name FROM shops WHERE shop_id = ?", (shop_id,)) as cur:
-                shop = await cur.fetchone()
-            if not shop:
-                return await callback.answer("❌ فروشگاه یافت نشد.", show_alert=True)
-
-            await db.execute("UPDATE shops SET status = 'APPROVED' WHERE shop_id = ?", (shop_id,))
-            await db.commit()
-
-    await callback.message.edit_text(
-        f"✅ فروشگاه <b>{html.escape(shop['shop_name'])}</b> (<code>{shop_id}</code>) با موفقیت تأیید شد.",
-        parse_mode="HTML"
-    )
-    try:
-        await callback.bot.send_message(
-            shop["owner_id"],
-            f"🎉 فروشگاه شما با نام «<b>{html.escape(shop['shop_name'])}</b>» تأیید و فعال شد!",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-
-
-@shop_router.callback_query(F.data.startswith("reject_shop:"))
-async def cb_reject_shop(callback: CallbackQuery):
-    if not is_super_admin(callback.from_user.id):
-        return await callback.answer("❌ فقط سوپرادمین می‌تواند این عملیات را انجام دهد.", show_alert=True)
-
-    shop_id = callback.data.split(":")[1]
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT owner_id, shop_name FROM shops WHERE shop_id = ?", (shop_id,)) as cur:
-                shop = await cur.fetchone()
-            if not shop:
-                return await callback.answer("❌ فروشگاه یافت نشد.", show_alert=True)
-
-            await db.execute("UPDATE shops SET status = 'REJECTED' WHERE shop_id = ?", (shop_id,))
-            await db.commit()
-
-    await callback.message.edit_text(
-        f"❌ درخواست فروشگاه <b>{html.escape(shop['shop_name'])}</b> (<code>{shop_id}</code>) رد شد.",
-        parse_mode="HTML"
-    )
-    try:
-        await callback.bot.send_message(
-            shop["owner_id"],
-            f"❌ درخواست ثبت فروشگاه «<b>{html.escape(shop['shop_name'])}</b>» توسط مدیریت رد شد.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-
-
-@shop_router.message(Command("add_product"))
-async def cmd_add_product(message: Message, state: FSMContext):
-    if not is_private(message):
-        return
-    user_id = message.from_user.id
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT shop_id, shop_name FROM shops WHERE owner_id = ? AND status = 'APPROVED'", (user_id,)) as cur:
-            shops = await cur.fetchall()
-
-    if not shops:
-        return await message.reply("❌ شما هیچ فروشگاه تأییدشده‌ای ندارید.")
-
-    if len(shops) == 1:
-        await state.update_data(shop_id=shops[0]["shop_id"])
-        await message.reply("📦 لطفاً **عنوان محصول** را وارد کنید:")
-        await state.set_state(AddProductForm.waiting_for_title)
-    else:
-        txt = "لطفاً شناسه شاپ موردنظر را وارد کنید:\n"
-        for s in shops:
-            txt += f"• <code>{s['shop_id']}</code> - {html.escape(s['shop_name'])}\n"
-        await message.reply(txt, parse_mode="HTML")
-        await state.set_state(AddProductForm.waiting_for_shop_id)
-
-
-@shop_router.message(AddProductForm.waiting_for_shop_id)
-async def process_prod_shop_id(message: Message, state: FSMContext):
-    shop_id = message.text.strip().lower()
-    await state.update_data(shop_id=shop_id)
-    await message.reply("📦 لطفاً **عنوان محصول** را وارد کنید:")
-    await state.set_state(AddProductForm.waiting_for_title)
-
-
-@shop_router.message(AddProductForm.waiting_for_title)
-async def process_prod_title(message: Message, state: FSMContext):
-    await state.update_data(title=message.text.strip())
-    await message.reply("📝 **توضیحات محصول** را وارد کنید (یا بنویسید -):")
-    await state.set_state(AddProductForm.waiting_for_desc)
-
-
-@shop_router.message(AddProductForm.waiting_for_desc)
-async def process_prod_desc(message: Message, state: FSMContext):
-    desc = message.text.strip()
-    await state.update_data(desc="" if desc == "-" else desc)
-    await message.reply("💰 **قیمت محصول به آتر** را وارد کنید:")
-    await state.set_state(AddProductForm.waiting_for_price)
-
-
-@shop_router.message(AddProductForm.waiting_for_price)
-async def process_prod_price(message: Message, state: FSMContext):
-    try:
-        price = int(message.text.strip())
-        if price <= 0:
-            raise ValueError
-    except ValueError:
-        return await message.reply("❌ قیمت باید یک عدد مثبت باشد.")
-
-    await state.update_data(price=price)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📦 بله (نیازمند پست)", callback_data="ship_yes"),
-        InlineKeyboardButton(text="⚡ خیر (بدون نیاز به پست)", callback_data="ship_no")
-    ]])
-    await message.reply("🚚 آیا این محصول نیاز به پست/ارسال دارد؟", reply_markup=kb)
-    await state.set_state(AddProductForm.waiting_for_needs_shipping)
-
-
-@shop_router.callback_query(AddProductForm.waiting_for_needs_shipping, F.data.startswith("ship_"))
-async def process_prod_needs_shipping(callback: CallbackQuery, state: FSMContext):
-    needs_ship = 1 if callback.data == "ship_yes" else 0
-    await state.update_data(needs_shipping=needs_ship, shipping_price=0)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="نامحدود", callback_data="stock_UNLIMITED"),
-        InlineKeyboardButton(text="تک عددی", callback_data="stock_SINGLE"),
-        InlineKeyboardButton(text="محدود", callback_data="stock_LIMITED")
-    ]])
-    await callback.message.edit_text("📊 نوع موجودی محصول را انتخاب کنید:", reply_markup=kb)
-    await state.set_state(AddProductForm.waiting_for_stock_type)
-
-
-@shop_router.callback_query(AddProductForm.waiting_for_stock_type, F.data.startswith("stock_"))
-async def process_prod_stock_type(callback: CallbackQuery, state: FSMContext):
-    stock_choice = callback.data.split("_")[1]
-
-    if stock_choice == "UNLIMITED":
-        await state.update_data(stock_type="UNLIMITED", stock_count=0)
-        await callback.message.edit_text("🖼 عکس محصول را ارسال کنید (یا کلمه `no` را بفرستید):")
-        await state.set_state(AddProductForm.waiting_for_photo)
-    elif stock_choice == "SINGLE":
-        await state.update_data(stock_type="LIMITED", stock_count=1)
-        await callback.message.edit_text("🖼 عکس محصول را ارسال کنید (یا کلمه `no` را بفرستید):")
-        await state.set_state(AddProductForm.waiting_for_photo)
-    elif stock_choice == "LIMITED":
-        await state.update_data(stock_type="LIMITED")
-        await callback.message.edit_text("🔢 تعداد موجودی کالا را وارد کنید:")
-        await state.set_state(AddProductForm.waiting_for_stock_count)
-
-
-@shop_router.message(AddProductForm.waiting_for_stock_count)
-async def process_prod_stock_count(message: Message, state: FSMContext):
-    try:
-        count = int(message.text.strip())
-        if count < 0:
-            raise ValueError
-    except ValueError:
-        return await message.reply("❌ تعداد باید عدد صحیح باشد.")
-
-    await state.update_data(stock_count=count)
-    await message.reply("🖼 عکس محصول را ارسال کنید (یا کلمه `no` را بفرستید):")
-    await state.set_state(AddProductForm.waiting_for_photo)
-
-
-@shop_router.message(AddProductForm.waiting_for_photo)
-async def process_prod_photo(message: Message, state: FSMContext):
-    photo_id = None
-    if message.photo:
-        photo_id = message.photo[-1].file_id
-    elif message.text and message.text.lower().strip() != "no":
-        return await message.reply("❌ لطفاً یک عکس ارسال کنید یا کلمه `no` را بنویسید.")
-
-    data = await state.get_data()
-    await state.clear()
-
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                INSERT INTO products (shop_id, title, description, price, stock_type, stock_count, photo_id, needs_shipping, shipping_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                data["shop_id"],
-                data["title"],
-                data["desc"],
-                data["price"],
-                data["stock_type"],
-                data.get("stock_count", 0),
-                photo_id,
-                data.get("needs_shipping", 0),
-                0
-            ))
-            product_id = cursor.lastrowid
-            await db.commit()
-
-    stock_info = "نامحدود" if data["stock_type"] == "UNLIMITED" else f"{data.get('stock_count', 1)} عدد"
-    ship_info = "نیازمند پست 🚚" if data.get("needs_shipping") else "بدون نیاز به پست"
-
-    await message.reply(
-        f"✅ <b>محصول با موفقیت ثبت شد!</b>\n\n"
-        f"📦 شناسه کالا: <code>{product_id}</code>\n"
-        f"🏷 عنوان: <b>{html.escape(data['title'])}</b>\n"
-        f"💰 قیمت کالا: <code>₳ {data['price']:,}</code>\n"
-        f"📊 موجودی: <b>{stock_info}</b>\n"
-        f"🚚 وضعیت ارسال: {ship_info}\n\n"
-        f"💡 برای انتشار در کانال از دستور زیر استفاده کنید:\n"
-        f"<code>/post_product {product_id}</code>",
-        parse_mode="HTML"
-    )
-
-
-@shop_router.message(Command("post_product"))
-async def cmd_post_product(message: Message):
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        return await message.reply("❌ مثال: <code>/post_product 12</code>", parse_mode="HTML")
-
-    product_id = int(args[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
-            SELECT p.*, s.shop_name, s.owner_id 
-            FROM products p 
-            JOIN shops s ON p.shop_id = s.shop_id 
-            WHERE p.product_id = ?
-        """, (product_id,)) as cur:
-            product = await cur.fetchone()
-
-    if not product:
-        return await message.reply("❌ کالایی یافت نشد.")
-
-    if product["owner_id"] != message.from_user.id and not is_super_admin(message.from_user.id):
-        return await message.reply("❌ شما مالک این شاپ نیستید.")
-
-    bot_info = await message.bot.get_me()
-    buy_link = f"https://t.me/{bot_info.username}?start=BUY_{product_id}"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🛒 خرید مستقیم", url=buy_link)
-    ]])
-
-    ship_text = "نیازمند پست 🚚" if product["needs_shipping"] else "بدون نیاز به پست"
-    stock_text = "نامحدود" if product["stock_type"] == "UNLIMITED" else f"{product['stock_count']} عدد"
-
-    caption = (
-        f"🛍️ <b>{html.escape(product['title'])}</b>\n\n"
-        f"🏪 فروشگاه: <b>{html.escape(product['shop_name'])}</b>\n"
-        f"📝 {html.escape(product['description'] or 'بدون توضیحات')}\n\n"
-        f"💰 قیمت کالا: <code>₳ {product['price']:,}</code>\n"
-        f"📦 موجودی: <b>{stock_text}</b>\n"
-        f"🚚 وضعیت ارسال: {ship_text}"
-    )
-
-    if product["photo_id"]:
-        await message.reply_photo(photo=product["photo_id"], caption=caption, reply_markup=kb, parse_mode="HTML")
-    else:
-        await message.reply(caption, reply_markup=kb, parse_mode="HTML")
-
-
-@shop_router.callback_query(F.data.startswith("confirm_buy_"))
-async def cb_confirm_buy(callback: CallbackQuery):
-    product_id = int(callback.data.split("_")[2])
-    buyer_id = callback.from_user.id
-
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("BEGIN IMMEDIATE")
-
-            async with db.execute("""
-                SELECT p.*, s.owner_id as seller_id, s.shop_name 
-                FROM products p 
-                JOIN shops s ON p.shop_id = s.shop_id 
-                WHERE p.product_id = ? AND s.status = 'APPROVED'
-            """, (product_id,)) as cur:
-                p = await cur.fetchone()
-
-            if not p:
-                await db.execute("ROLLBACK")
-                return await callback.answer("❌ محصول یافت نشد یا فروشگاه غیرفعال است.", show_alert=True)
-
-            if p["stock_type"] == "LIMITED" and p["stock_count"] <= 0:
-                await db.execute("ROLLBACK")
-                return await callback.answer("❌ موجودی این کالا به پایان رسیده است.", show_alert=True)
-
-            async with db.execute("SELECT balance, is_frozen FROM users WHERE user_id = ?", (buyer_id,)) as cur:
-                buyer = await cur.fetchone()
-
-            if not buyer or buyer["is_frozen"]:
-                await db.execute("ROLLBACK")
-                return await callback.answer("❌ حساب شما مسدود (فریز) است.", show_alert=True)
-
-            product_price = p["price"]
-            total_price = product_price
-
-            if buyer["balance"] < total_price:
-                await db.execute("ROLLBACK")
-                return await callback.answer("❌ موجودی حساب شما برای خرید این کالا کافی نیست.", show_alert=True)
-
-            seller_pct, treasury_pct, tax_pct = await get_shop_rates()
-
-            seller_share = (product_price * seller_pct) // 100
-            total_treasury_share = (product_price * treasury_pct) // 100
-
-            seller_id = p["seller_id"]
-
-            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total_price, buyer_id))
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (seller_share, seller_id))
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = 0", (total_treasury_share,))
-
-            if p["stock_type"] == "LIMITED":
-                await db.execute("UPDATE products SET stock_count = stock_count - 1 WHERE product_id = ?", (product_id,))
-
-            now_iso = datetime.now(timezone.utc).isoformat()
-            async with db.execute("""
-                INSERT INTO orders (user_id, shop_id, product_id, amount, status, created_at)
-                VALUES (?, ?, ?, ?, 'DELIVERED', ?)
-            """, (buyer_id, p["shop_id"], product_id, total_price, now_iso)) as cur:
-                order_id = cur.lastrowid
-
-            tx_id = f"TX-SHOP-{uuid.uuid4().hex[:8]}"
-            await db.execute("""
-                INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason, status)
-                VALUES (?, ?, ?, 0, ?, ?, 'SUCCESS')
-            """, (tx_id, now_iso, buyer_id, total_price, f"خرید از شاپ [{p['shop_id']}] - کالا {product_id}"))
-
-            await db.commit()
-
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer(
-        f"🎉 <b>خرید با موفقیت انجام شد!</b>\n\n"
-        f"📦 نام کالا: <b>{html.escape(p['title'])}</b>\n"
-        f"🏪 فروشگاه: <b>{html.escape(p['shop_name'])}</b>\n"
-        f"💰 مبلغ پرداختی کل: <code>₳ {total_price:,}</code>\n"
-        f"🔖 شماره سفارش: <code>{order_id}</code>",
-        parse_mode="HTML"
-    )
-
-    try:
-        await callback.bot.send_message(
-            seller_id,
-            f"🛍️ <b>سفارش جدید دریافت شد!</b>\n\n"
-            f"📦 کالا: <b>{html.escape(p['title'])}</b>\n"
-            f"💵 قیمت محصول: <code>₳ {product_price:,}</code>\n"
-            f"🚚 نیاز به ارسال پست: {'بله' if p['needs_shipping'] else 'خیر'}\n"
-            f"📥 سهم واریزی شما ({seller_pct}٪): <code>₳ {seller_share:,}</code>\n"
-            f"👤 خریدار: <code>{buyer_id}</code>",
-            parse_mode="HTML"
-        )
-    except Exception:
-        pass
-
-
-@shop_router.message(Command("shops"))
-async def cmd_shops(message: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT shop_id, shop_name FROM shops WHERE status = 'APPROVED'") as cur:
-            shops = await cur.fetchall()
-
-    if not shops:
-        return await message.reply("🏪 هیچ فروشگاه فعالی وجود ندارد.")
-
-    txt = "🏪 <b>لیست فروشگاه‌های فعال:</b>\n\n"
-    for s in shops:
-        txt += f"• <b>{html.escape(s['shop_name'])}</b> | شناسه: <code>{s['shop_id']}</code>\n"
-    await message.reply(txt, parse_mode="HTML")
-
-
-# --- دستورات مدیریتی شاپ، پستچی و خزانه مرکزی ---
-
-@admin_router.message(Command("add_courier"))
-async def cmd_add_courier(message: Message):
-    if not is_super_admin(message.from_user.id):
-        return
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        return await message.reply("استفاده: <code>/add_courier [user_id]</code>", parse_mode="HTML")
-
-    user_id = int(args[1])
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR IGNORE INTO couriers (user_id) VALUES (?)", (user_id,))
-            await db.commit()
-
-    await message.reply(f"✅ کاربر <code>{user_id}</code> به عنوان پستچی اضافه شد.", parse_mode="HTML")
-
-
-@admin_router.message(Command("remove_courier"))
-async def cmd_remove_courier(message: Message):
-    if not is_super_admin(message.from_user.id):
-        return
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        return await message.reply("استفاده: <code>/remove_courier [user_id]</code>", parse_mode="HTML")
-
-    user_id = int(args[1])
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM couriers WHERE user_id = ?", (user_id,))
-            await db.commit()
-
-    await message.reply(f"❌ کاربر <code>{user_id}</code> از لیست پستچی‌ها حذف شد.", parse_mode="HTML")
-
-
-@admin_router.message(Command("delete_shop"))
-async def cmd_delete_shop(message: Message):
-    if not is_super_admin(message.from_user.id):
-        return
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply("استفاده: <code>/delete_shop [shop_id]</code>", parse_mode="HTML")
-
-    shop_id = args[1].lower().strip()
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM products WHERE shop_id = ?", (shop_id,))
-            await db.execute("DELETE FROM shops WHERE shop_id = ?", (shop_id,))
-            await db.commit()
-
-    await message.reply(f"🗑 فروشگاه <code>{shop_id}</code> و تمامی محصولات آن حذف شدند.", parse_mode="HTML")
-
-
-@admin_router.message(Command("set_shop_rates"))
-async def cmd_set_shop_rates(message: Message):
-    if not is_private(message) or not is_super_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-    if len(args) < 4:
-        s, t, x = await get_shop_rates()
-        return await message.reply(
-            f"⚙️ <b>تنظیمات فعلی تقسیم درصد فروشگاه:</b>\n"
-            f"• سهم فروشنده: <code>%{s}</code>\n"
-            f"• سهم خزانه بانک: <code>%{t}</code>\n"
-            f"• مالیات (سوخت): <code>%{x}</code>\n\n"
-            f"💡 <b>نحوه تغییر:</b>\n"
-            f"<code>/set_shop_rates [فروشنده] [خزانه] [مالیات]</code>\n"
-            f"<i>مثال: <code>/set_shop_rates 51 40 9</code></i>",
-            parse_mode="HTML"
-        )
-
-    try:
-        seller, treasury, tax = int(args[1]), int(args[2]), int(args[3])
-    except ValueError:
-        return await message.reply("❌ درصدها باید اعداد صحیح باشند.")
-
-    if seller < 0 or treasury < 0 or tax < 0 or (seller + treasury + tax != 100):
-        return await message.reply("❌ مجموع ۳ درصد باید دقیقاً برابر با **۱۰۰** باشد.")
-
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR REPLACE INTO shop_settings (key, value) VALUES ('seller_pct', ?)", (seller,))
-            await db.execute("INSERT OR REPLACE INTO shop_settings (key, value) VALUES ('treasury_pct', ?)", (treasury,))
-            await db.execute("INSERT OR REPLACE INTO shop_settings (key, value) VALUES ('tax_pct', ?)", (tax,))
-            await db.commit()
-
-    await message.reply(
-        f"✅ <b>درصدهای شاپ با موفقیت به‌روزرسانی شد!</b>\n\n"
-        f"🏪 سهم فروشنده: <b>%{seller}</b>\n"
-        f"🏛 سهم خزانه: <b>%{treasury}</b>\n"
-        f"🔥 مالیات (سوخت): <b>%{tax}</b>",
-        parse_mode="HTML"
-    )
-
-
-@admin_router.message(Command("set_courier_rates"))
-async def cmd_set_courier_rates(message: Message):
-    if not is_private(message) or not is_super_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-    if len(args) < 4:
-        c, t, x = await get_courier_rates()
-        return await message.reply(
-            f"⚙️ <b>تنظیمات فعلی درصد پُستچی:</b>\n"
-            f"• سهم پستچی: <code>%{c}</code>\n"
-            f"• سهم خزانه بانک: <code>%{t}</code>\n"
-            f"• مالیات (سوخت): <code>%{x}</code>\n\n"
-            f"💡 <b>نحوه تغییر:</b>\n"
-            f"<code>/set_courier_rates (پستچی) (خزانه) (مالیات)</code>\n"
-            f"<i>مثال: <code>/set_courier_rates 70 20 10</code></i>",
-            parse_mode="HTML"
-        )
-
-    try:
-        courier, treasury, tax = int(args[1]), int(args[2]), int(args[3])
-    except ValueError:
-        return await message.reply("❌ درصدها باید اعداد صحیح باشند.")
-
-    if courier < 0 or treasury < 0 or tax < 0 or (courier + treasury + tax != 100):
-        return await message.reply("❌ مجموع ۳ درصد باید دقیقاً برابر با **۱۰۰** باشد.")
-
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR REPLACE INTO shop_settings (key, value) VALUES ('courier_pct', ?)", (courier,))
-            await db.execute("INSERT OR REPLACE INTO shop_settings (key, value) VALUES ('courier_treasury_pct', ?)", (treasury,))
-            await db.execute("INSERT OR REPLACE INTO shop_settings (key, value) VALUES ('courier_tax_pct', ?)", (tax,))
-            await db.commit()
-
-    await message.reply(
-        f"✅ <b>درصدهای پستچی با موفقیت به‌روزرسانی شد!</b>\n\n"
-        f"🚚 سهم پستچی: <b>%{courier}</b>\n"
-        f"🏛 سهم خزانه: <b>%{treasury}</b>\n"
-        f"🔥 مالیات (سوخت): <b>%{tax}</b>",
-        parse_mode="HTML"
-    )
-
-
-@admin_router.message(Command("treasury"))
-async def cmd_treasury_status(message: Message):
-    if not is_super_admin(message.from_user.id):
-        return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT balance FROM users WHERE user_id = 0") as cur:
-            bank = await cur.fetchone()
-            balance = bank["balance"] if bank else 0
-
-    await message.reply(
-        f"🏛️ <b>موجودی خزانه بانک مرکزی:</b>\n"
-        f"<code>₳ {balance:,}</code>",
-        parse_mode="HTML"
-    )
-
-
-@admin_router.message(Command("withdraw_treasury"))
-async def cmd_withdraw_treasury(message: Message):
-    user_id = message.from_user.id
-    if not is_super_admin(user_id):
-        return await message.reply("❌ فقط سوپرادمین به خزانه دسترسی دارد.")
-
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply(
-            "❌ <b>نحوه استفاده از دستور:</b>\n\n"
-            "• برداشت به حساب خودتان:\n<code>/withdraw_treasury 50000</code>\n\n"
-            "• برداشت و واریز به حساب دیگری:\n<code>/withdraw_treasury 50000 12345678</code>",
-            parse_mode="HTML"
-        )
-
-    try:
-        amount = int(args[1])
-        target_user_id = int(args[2]) if len(args) >= 3 else user_id
-    except ValueError:
-        return await message.reply("❌ مبلغ یا آیدی واردشده نامعتبر است.")
-
-    if amount <= 0:
-        return await message.reply("❌ مبلغ برداشت باید بزرگتر از صفر باشد.")
-
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("BEGIN IMMEDIATE")
-
-            async with db.execute("SELECT balance FROM users WHERE user_id = 0") as cur:
-                treasury = await cur.fetchone()
-                treasury_balance = treasury["balance"] if treasury else 0
-
-            if treasury_balance < amount:
-                await db.execute("ROLLBACK")
-                return await message.reply(f"❌ موجودی خزانه کافی نیست!\n💰 موجودی فعلی: <code>₳ {treasury_balance:,}</code>", parse_mode="HTML")
-
-            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = 0", (amount,))
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_user_id))
-
-            tx_id = f"TX-TR-WITHDRAW-{uuid.uuid4().hex[:6]}"
-            now_iso = datetime.now(timezone.utc).isoformat()
-            await db.execute("""
-                INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason, status)
-                VALUES (?, ?, 0, ?, ?, 'برداشت مستقیم ادمین از خزانه', 'SUCCESS')
-            """, (tx_id, now_iso, target_user_id, amount))
-
-            await db.commit()
-
-    await message.reply(
-        f"✅ <b>برداشت از خزانه با موفقیت انجام شد!</b>\n\n"
-        f"💸 مبلغ برداشت شده: <code>₳ {amount:,}</code>\n"
-        f"📥 مقصد واریز: <code>{target_user_id}</code>\n"
-        f"🔖 شناسه تراکنش: <code>{tx_id}</code>",
-        parse_mode="HTML"
-    )
-
-
-# --- بخش مدیریت و ادمین عمومی ---
 
 @admin_router.message(Command("users"))
 async def cmd_users(message: Message):
@@ -1622,6 +781,7 @@ async def cb_users_noop(callback: CallbackQuery):
 
 @admin_router.message(Command("create_group"))
 async def cmd_create_group(message: Message):
+    """فقط گروه را به لیست اضافه می‌کند (بدون ساخت لینک)"""
     if not is_private(message) or not await check_admin_filter(message):
         return
 
@@ -2093,7 +1253,7 @@ async def admin_confirm_yes(callback: CallbackQuery, state: FSMContext):
                     f"📝 دلیل: {safe_reason}\n"
                     f"🔖 شناسه: <code>{tx_id}</code>"
                 )
-            else:
+            else:  # take
                 if u["balance"] < amount:
                     return await callback.message.edit_text("❌ موجودی ناکافی.")
                 tx_id = f"TX-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{random.randint(100000, 999999)}"
@@ -2179,7 +1339,8 @@ async def cmd_reward_group(message: Message):
                     await db.execute("BEGIN IMMEDIATE")
                     sub_tx_id = f"TX-G-{str(uuid.uuid4()).upper()[:12]}"
                     await db.execute(
-                        "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                        "UPDATE users SET balance = balance + ? WHERE user_id"
+                        " = ?",
                         (amount, u["user_id"]),
                     )
                     await db.execute(
@@ -2232,7 +1393,8 @@ async def cmd_undo(message: Message):
             await db.execute("BEGIN IMMEDIATE")
 
             async with db.execute(
-                "SELECT from_user, to_user, amount, status FROM audit_logs WHERE tx_id = ?",
+                "SELECT from_user, to_user, amount, status FROM audit_logs"
+                " WHERE tx_id = ?",
                 (tx_id,),
             ) as cur:
                 tx = await cur.fetchone()
@@ -2488,6 +1650,7 @@ async def cmd_check(message: Message):
 
 # --- دستورات بکاپ‌گیری دستی و بازیابی ---
 
+
 @admin_router.message(Command("backup_now"))
 async def cmd_backup_now(message: Message):
     if not is_private(message) or not is_super_admin(message.from_user.id):
@@ -2532,3 +1695,112 @@ async def cmd_restore(message: Message):
             "❌ لطفاً این دستور را در **ریپلای (Reply)** روی یک فایل بکاپ ZIP"
             " یا db ارسال کنید."
         )
+
+    doc = message.reply_to_message.document
+    file_info = await message.bot.get_file(doc.file_id)
+    download_path = f"temp_restore_{doc.file_name}"
+
+    await message.bot.download_file(file_info.file_path, download_path)
+
+    try:
+        if download_path.endswith(".zip"):
+            with zipfile.ZipFile(download_path, "r") as zip_ref:
+                zip_ref.extractall("temp_extract")
+            extracted_db = os.path.join("temp_extract", "atr_bank.db")
+            if os.path.exists(extracted_db):
+                shutil.move(extracted_db, DB_PATH)
+                shutil.rmtree("temp_extract")
+            else:
+                os.remove(download_path)
+                return await message.reply("❌ فایل `atr_bank.db` در فایل زیپ یافت نشد.")
+        else:
+            shutil.move(download_path, DB_PATH)
+
+        if os.path.exists(download_path):
+            os.remove(download_path)
+
+        await message.reply(
+            "<b>✅ پایگاه‌داده با موفقیت بازیابی شد!</b> ربات آماده به کار است.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.reply(f"❌ خطا در بازیابی دیتابیس: {e}")
+
+
+# --- راهنمای دستورات ---
+
+
+@user_router.message(Command("help"))
+@user_router.message(F.text == "راهنمای جامع بانک")
+async def cmd_help(message: Message):
+    user_id = message.from_user.id
+    is_sa = is_super_admin(user_id)
+    u = await get_user_data(user_id)
+    is_adm = u and u["is_admin"]
+
+    txt = (
+        "📱 <b>راهنمای دستورات کاربران:</b>\n"
+        "🔹 <code>/start</code> - شروع و دریافت شماره حساب\n"
+        "🔹 <code>/profile</code> یا «پروفایل» - مشاهده نام، شماره حساب، موجودی و وضعیت\n"
+        "🔹 <code>/transfer</code> یا «انتقال آتر» - انتقال آتر (چند روش مختلف)\n\n"
+    )
+
+    if is_adm or is_sa:
+        txt += (
+            "👥 <b>دستورات ادمین (فقط پیوی):</b>\n"
+            "🔹 <code>/users</code> - لیست کاربران\n"
+            "🔹 <code>/groups</code> - لیست گروه‌ها\n"
+            "🔹 <code>/group_users [نام]</code> - اعضای یک گروه\n"
+            "🔹 <code>/create_group [نام]</code> - فقط اضافه کردن گروه (بدون لینک)\n"
+            "🔹 <code>/add_group [نام]</code> - ساخت <b>گروه مجازی</b> + لینک دعوت یکتا (این گروه فقط درون ربات است)\n"
+            "🔹 <code>/extend_group [نام] [روز]</code> - تمدید لینک فعلی\n"
+            "🔹 <code>/renew_group [نام] [روز]</code> - ساخت لینک جدید با مدت اعتبار\n"
+            "🔹 <code>/rename_group [قدیمی] [جدید]</code> - تغییر نام گروه\n"
+            "🔹 <code>/move_group [آیدی] [گروه]</code> - تغییر گروه کاربر\n"
+            "🔹 <code>/remove_group [آیدی]</code> - برگرداندن به Default\n\n"
+        )
+
+    if is_sa:
+        txt += (
+            "👑 <b>دستورات سوپرادمین (فقط پیوی):</b>\n"
+            "🔸 <code>/give [آیدی] [مقدار]</code> - واریز (با تأیید دو مرحله‌ای)\n"
+            "🔸 <code>/take [آیدی] [مقدار]</code> - کسر (با تأیید دو مرحله‌ای)\n"
+            "🔸 <code>/rewardgroup [گروه] [مقدار]</code> - پاداش گروهی\n"
+            "🔸 <code>/undo [شناسه]</code> - برگشت تراکنش\n"
+            "🔸 <code>/economy</code> - آمار اقتصاد\n"
+            "🔸 <code>/check [آیدی]</code> - اطلاعات کامل کاربر\n"
+            "🔸 <code>/promote [آیدی]</code> - ارتقا به ادمین\n"
+            "🔸 <code>/demote [آیدی]</code> - عزل ادمین\n"
+            "🔸 <code>/list_admins</code> - مشاهده لیست ادمین‌ها و سوپرادمین‌ها\n"
+            "🔸 <code>/add_super [آیدی]</code> - اضافه کردن سوپرادمین جدید\n"
+            "🔸 <code>/remove_super [آیدی]</code> - حذف سوپرادمین\n"
+            "🔸 <code>/delete_group [نام]</code> - حذف کامل گروه\n"
+            "🔸 <code>/freeze [آیدی]</code> - فریز حساب\n"
+            "🔸 <code>/unfreeze [آیدی]</code> - رفع فریز\n"
+            "🔸 <code>/backup_now</code> - بکاپ ZIP\n"
+            "🔸 <code>/force_backup</code> - ارسال بکاپ به کانال\n"
+            "🔸 <code>/restore</code> - بازیابی (ریپلای روی فایل)\n"
+        )
+
+    await message.reply(txt, parse_mode="HTML")
+
+
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+
+    await start_dummy_server()
+    await restore_db_from_telegram(bot)
+    await init_db()
+
+    asyncio.create_task(auto_backup_loop(bot))
+
+    dp = Dispatcher(storage=MemoryStorage())
+
+    dp.include_router(admin_router)
+    dp.include_router(user_router)
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
