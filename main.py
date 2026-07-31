@@ -73,6 +73,10 @@ class AdminConfirmForm(StatesGroup):
     waiting_for_confirm = State()
 
 
+class ResetForm(StatesGroup):
+    waiting_for_confirm = State()
+
+
 class AntiSpamMiddleware(BaseMiddleware):
 
     def __init__(self, limit=1.5):
@@ -1648,6 +1652,56 @@ async def cmd_check(message: Message):
         )
 
 
+# --- دستور صفر کردن دیتابیس و ری‌استارت ---
+
+
+@admin_router.message(Command("reset_all"))
+async def cmd_reset_all(message: Message, state: FSMContext):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="💣 بله، دیتابیس کاملاً پاک شود", callback_data="reset_yes"),
+            InlineKeyboardButton(text="❌ انصراف", callback_data="reset_no"),
+        ]]
+    )
+    await message.reply(
+        "⚠️ <b>هشدار بسیار مهم!</b>\n\n"
+        "آیا مطمئن هستید؟ این دستور تمام داده‌ها، کاربران، گروه‌ها و تراکنش‌ها را <b>حذف کاملاً دائم</b> می‌کند و دیتابیس صفر خواهد شد.\n\n"
+        "آیا قصد ادامه دارید؟",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+    await state.set_state(ResetForm.waiting_for_confirm)
+
+
+@admin_router.callback_query(ResetForm.waiting_for_confirm, F.data == "reset_yes")
+async def cb_reset_yes(callback: CallbackQuery, state: FSMContext):
+    if not is_super_admin(callback.from_user.id):
+        return await callback.answer("❌ عدم دسترسی.", show_alert=True)
+
+    await state.clear()
+    await callback.message.edit_text("⏳ در حال حذف دیتابیس و ری‌ست کردن سیستم...")
+
+    async with db_lock:
+        if os.path.exists(DB_PATH):
+            try:
+                os.remove(DB_PATH)
+            except Exception as e:
+                return await callback.message.edit_text(f"❌ خطا در حذف فایل دیتابیس: {e}")
+
+        await init_db()
+
+    await callback.message.edit_text("💥 <b>دیتابیس با موفقیت صفر شد و ربات ری‌ست گردید!</b>", parse_mode="HTML")
+
+
+@admin_router.callback_query(ResetForm.waiting_for_confirm, F.data == "reset_no")
+async def cb_reset_no(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ عملیات صفر کردن دیتابیس لغو شد.")
+
+
 # --- دستورات بکاپ‌گیری دستی و بازیابی ---
 
 
@@ -1780,6 +1834,7 @@ async def cmd_help(message: Message):
             "🔸 <code>/backup_now</code> - بکاپ ZIP\n"
             "🔸 <code>/force_backup</code> - ارسال بکاپ به کانال\n"
             "🔸 <code>/restore</code> - بازیابی (ریپلای روی فایل)\n"
+            "🔸 <code>/reset_all</code> - پاکسازی کامل دیتابیس و ری‌ست ربات\n"
         )
 
     await message.reply(txt, parse_mode="HTML")
