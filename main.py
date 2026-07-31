@@ -24,7 +24,8 @@ from aiogram.types import (
 import aiosqlite
 from aiohttp import web  # اضافه شده برای ایجاد Web Service در Render
 
-from shop import shop_router  # <--- اضافه شده در گام ۲
+# وارد کردن ماژول شاپ
+from shop_module import shop_router, init_shop_db
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -1831,14 +1832,18 @@ async def main():
     await start_dummy_server()
     await restore_db_from_telegram(bot)
     await init_db()
+    
+    # ۱. راه‌اندازی دیتابیس شاپ
+    await init_shop_db()
 
     asyncio.create_task(auto_backup_loop(bot))
 
     dp = Dispatcher(storage=MemoryStorage())
 
+    # ۲. ثبت روتور شاپ در Dispatcher
+    dp.include_router(shop_router)
     dp.include_router(admin_router)
     dp.include_router(user_router)
-    dp.include_router(shop_router)  # <--- اضافه شده در گام ۲
 
     await dp.start_polling(bot)
 
