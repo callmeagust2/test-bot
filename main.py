@@ -315,6 +315,19 @@ user_router.message.middleware(AntiSpamMiddleware())
 shop_router.message.middleware(AntiSpamMiddleware())
  
  
+# --- دستور همگانی /cancel ---
+# این هندلر عمداً بلافاصله بعد از تعریف روترها و قبل از هر هندلر دیگری ثبت می‌شود
+# تا در هر مرحله از هر فرآیندی (انتقال آتر، ساخت فروشگاه، ثبت محصول، ریست و ...)
+# با اولویت بالاتر از هندلرهای مخصوص هر state اجرا شده و آن عملیات را لغو کند.
+@user_router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        return await message.reply("ℹ️ در حال حاضر هیچ عملیات درحال‌انجامی برای لغو کردن وجود ندارد.")
+    await state.clear()
+    await message.reply("✅ عملیات جاری با موفقیت لغو شد. می‌توانید از ابتدا شروع کنید.")
+ 
+ 
 async def check_admin_filter(message: Message) -> bool:
     if is_super_admin(message.from_user.id):
         return True
@@ -2329,10 +2342,91 @@ async def cmd_my_shop(message: Message):
     )
  
  
-# --- ۳. خرید محصول و محاسبات دقیق مالی آتر ---
+# --- ۳. خرید محصول و محاسبات دقیق مالی آتر (با تاییدیه دو مرحله‌ای) ---
  
 @shop_router.callback_query(F.data.startswith("buy_prod_"))
-async def cb_buy_product(callback: CallbackQuery):
+async def cb_initiate_buy(callback: CallbackQuery):
+    """مرحله اول: بررسی اولیه و ارسال پیام تاییدیه به پیوی خریدار (بدون کسر هیچ مبلغی)."""
+    buyer_id = callback.from_user.id
+    product_id = int(callback.data.split("_")[2])
+ 
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM products WHERE product_id = ?", (product_id,)) as cur:
+            prod = await cur.fetchone()
+ 
+        if not prod:
+            return await callback.answer("❌ محصول پیدا نشد.", show_alert=True)
+ 
+        if prod["stock_type"] != "UNLIMITED" and prod["stock_qty"] <= 0:
+            return await callback.answer("❌ موجودی این محصول به اتمام رسیده است.", show_alert=True)
+ 
+        if prod["stock_type"] != "UNLIMITED":
+            async with db.execute(
+                "SELECT 1 FROM orders WHERE buyer_id = ? AND product_id = ? LIMIT 1",
+                (buyer_id, product_id)
+            ) as cur_chk:
+                already_bought = await cur_chk.fetchone()
+            if already_bought:
+                return await callback.answer(
+                    "❌ این محصول محدود است و شما قبلاً یک عدد از آن را خریداری کرده‌اید.",
+                    show_alert=True
+                )
+ 
+        async with db.execute("SELECT balance, is_frozen FROM users WHERE user_id = ?", (buyer_id,)) as cur_u:
+            buyer = await cur_u.fetchone()
+ 
+    if not buyer or buyer["is_frozen"]:
+        return await callback.answer("❌ حساب شما مسدود یا غیرفعال است.", show_alert=True)
+ 
+    price = prod["price"]
+    courier_fee = 0
+    if prod["needs_courier"]:
+        t1 = await get_setting("tier1_pct")
+        t2 = await get_setting("tier2_pct")
+        t3 = await get_setting("tier3_pct")
+        if price <= 99:
+            courier_fee = int(price * (t1 / 100.0))
+        elif price <= 999:
+            courier_fee = int(price * (t2 / 100.0))
+        else:
+            courier_fee = int(price * (t3 / 100.0))
+    total_cost = price + courier_fee
+ 
+    if buyer["balance"] < total_cost:
+        return await callback.answer(f"❌ موجودی ناکافی! قیمت محصول: ₳ {price} + هزینه پست: ₳ {courier_fee} = مجموع: ₳ {total_cost}", show_alert=True)
+ 
+    safe_title = html.escape(prod['title'])
+    if prod["needs_courier"]:
+        cost_line = f"💰 قیمت محصول: <code>₳ {price}</code>\n🚚 هزینه پست: <code>₳ {courier_fee}</code>\n💳 مجموع پرداختی: <code>₳ {total_cost}</code>\n"
+    else:
+        cost_line = f"💰 مبلغ پرداختی: <code>₳ {price}</code>\n"
+ 
+    confirm_txt = (
+        f"🛍 <b>تاییدیه خرید</b>\n\n"
+        f"📦 محصول: <b>{safe_title}</b>\n"
+        f"{cost_line}\n"
+        f"❓ آیا از خرید این محصول مطمئن هستید؟ در صورت تایید، مبلغ فوراً از حساب شما کسر می‌شود."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تایید و پرداخت", callback_data=f"confirm_buy_{product_id}"),
+        InlineKeyboardButton(text="❌ انصراف", callback_data=f"cancel_buy_{product_id}"),
+    ]])
+ 
+    try:
+        await callback.bot.send_message(buyer_id, confirm_txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        return await callback.answer(
+            "⚠️ ابتدا ربات را در پیوی (چت خصوصی) استارت کنید، سپس دوباره روی خرید بزنید.",
+            show_alert=True
+        )
+ 
+    await callback.answer("📩 جهت تایید نهایی خرید، به پیوی ربات مراجعه کنید.", show_alert=True)
+ 
+ 
+@shop_router.callback_query(F.data.startswith("confirm_buy_"))
+async def cb_confirm_buy(callback: CallbackQuery):
+    """مرحله دوم: تایید نهایی خریدار در پیوی ربات و اجرای واقعی تراکنش خرید."""
     buyer_id = callback.from_user.id
     product_id = int(callback.data.split("_")[2])
  
@@ -2343,10 +2437,20 @@ async def cb_buy_product(callback: CallbackQuery):
                 prod = await cur.fetchone()
  
             if not prod:
-                return await callback.answer("❌ محصول پیدا نشد.", show_alert=True)
+                await callback.answer("❌ محصول پیدا نشد یا حذف شده است.", show_alert=True)
+                try:
+                    await callback.message.edit_text("❌ این محصول دیگر در دسترس نیست.")
+                except Exception:
+                    pass
+                return
  
             if prod["stock_type"] != "UNLIMITED" and prod["stock_qty"] <= 0:
-                return await callback.answer("❌ موجودی این محصول به اتمام رسیده است.", show_alert=True)
+                await callback.answer("❌ موجودی این محصول به اتمام رسیده است.", show_alert=True)
+                try:
+                    await callback.message.edit_text("❌ متاسفانه موجودی این محصول قبل از تایید شما به اتمام رسید.")
+                except Exception:
+                    pass
+                return
  
             # جلوگیری از خرید بیش از یک عدد توسط یک کاربر، فقط برای محصولات محدود/تکی
             # (محصولات نامحدود هیچ محدودیتی در تعداد خرید ندارند)
@@ -2357,10 +2461,15 @@ async def cb_buy_product(callback: CallbackQuery):
                 ) as cur_chk:
                     already_bought = await cur_chk.fetchone()
                 if already_bought:
-                    return await callback.answer(
+                    await callback.answer(
                         "❌ این محصول محدود است و شما قبلاً یک عدد از آن را خریداری کرده‌اید.",
                         show_alert=True
                     )
+                    try:
+                        await callback.message.edit_text("❌ شما قبلاً این محصول محدود را خریداری کرده‌اید.")
+                    except Exception:
+                        pass
+                    return
  
             async with db.execute("SELECT balance, is_frozen FROM users WHERE user_id = ?", (buyer_id,)) as cur_u:
                 buyer = await cur_u.fetchone()
@@ -2386,7 +2495,12 @@ async def cb_buy_product(callback: CallbackQuery):
             total_cost = price + courier_fee
  
             if buyer["balance"] < total_cost:
-                return await callback.answer(f"❌ موجودی ناکافی! قیمت محصول: ₳ {price} + هزینه پست: ₳ {courier_fee} = مجموع: ₳ {total_cost}", show_alert=True)
+                await callback.answer(f"❌ موجودی ناکافی! قیمت محصول: ₳ {price} + هزینه پست: ₳ {courier_fee} = مجموع: ₳ {total_cost}", show_alert=True)
+                try:
+                    await callback.message.edit_text("❌ موجودی حساب شما برای این خرید کافی نیست.")
+                except Exception:
+                    pass
+                return
  
             # کسر مبلغ از خریدار
             await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total_cost, buyer_id))
@@ -2445,12 +2559,24 @@ async def cb_buy_product(callback: CallbackQuery):
  
     await callback.answer("🎉 خرید با موفقیت انجام شد!", show_alert=True)
  
-    # ارسال کد ۱۰ رقمی هم‌زمان برای خریدار، فروشنده و پستچی‌ها
-    msg_buyer = f"🎉 خرید شما نهایی شد!\n🛍 محصول: <b>{html.escape(prod['title'])}</b>\n🔐 کد امنیتی ۱۰ رقمی شما: <code>{code_10}</code>"
+    # ویرایش پیام تاییدیه در پیوی خریدار با جزئیات نهایی خرید
+    if prod["needs_courier"]:
+        cost_line = f"💰 قیمت محصول: <code>₳ {price}</code>\n🚚 هزینه پست: <code>₳ {courier_fee}</code>\n💳 مجموع پرداختی: <code>₳ {total_cost}</code>\n"
+    else:
+        cost_line = f"💰 مبلغ پرداختی: <code>₳ {price}</code>\n"
+    msg_buyer = (
+        f"🎉 خرید شما نهایی شد!\n"
+        f"🛍 محصول: <b>{html.escape(prod['title'])}</b>\n"
+        f"{cost_line}"
+        f"🔐 کد امنیتی ۱۰ رقمی شما: <code>{code_10}</code>"
+    )
     try:
-        await callback.bot.send_message(buyer_id, msg_buyer, parse_mode="HTML")
+        await callback.message.edit_text(msg_buyer, parse_mode="HTML")
     except Exception:
-        pass
+        try:
+            await callback.bot.send_message(buyer_id, msg_buyer, parse_mode="HTML")
+        except Exception:
+            pass
  
     msg_seller = f"🛍 سفارش جدید ثبت شد!\nمحصول: <b>{html.escape(prod['title'])}</b>\n🔐 کد امنیتی ۱۰ رقمی: <code>{code_10}</code>"
     try:
@@ -2476,6 +2602,16 @@ async def cb_buy_product(callback: CallbackQuery):
                 await callback.bot.send_message(c[0], msg_courier, parse_mode="HTML")
             except Exception:
                 pass
+ 
+ 
+@shop_router.callback_query(F.data.startswith("cancel_buy_"))
+async def cb_cancel_buy(callback: CallbackQuery):
+    """انصراف خریدار از خرید در مرحله تاییدیه؛ هیچ مبلغی کسر نشده بود."""
+    await callback.answer("❌ خرید لغو شد.")
+    try:
+        await callback.message.edit_text("❌ خرید توسط شما لغو شد. هیچ مبلغی از حساب شما کسر نشد.")
+    except Exception:
+        pass
  
  
 # --- ۴. دستورات پستچی‌ها (Couriers) ---
@@ -2664,6 +2800,7 @@ async def cmd_help(message: Message):
     txt = (
         "📱 <b>راهنمای دستورات کاربران:</b>\n"
         "🔹 <code>/start</code> - شروع و دریافت شماره حساب\n"
+        "🔹 <code>/cancel</code> - لغو هر عملیات درحال‌انجام (انتقال، ساخت فروشگاه، ثبت محصول و...)\n"
         "🔹 <code>/profile</code> یا «پروفایل» - مشاهده نام، شماره حساب، موجودی و وضعیت\n"
         "🔹 <code>/transfer</code> یا «انتقال آتر» - انتقال آتر (چند روش مختلف)\n"
         "🔹 <code>/my_orders</code> - مشاهده وضعیت سفارش‌های خریداری‌شده\n"
