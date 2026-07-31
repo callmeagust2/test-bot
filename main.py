@@ -97,6 +97,7 @@ class CheckoutForm(StatesGroup):
 
 class ShopRequestForm(StatesGroup):
     waiting_for_shop_name = State()
+    waiting_for_channel_id = State()
 
 
 class AntiSpamMiddleware(BaseMiddleware):
@@ -118,6 +119,16 @@ class AntiSpamMiddleware(BaseMiddleware):
                 return
         self.users[user_id] = now
         return await handler(event, data)
+
+
+# --- محاسبه هزینه پست متغیر ---
+def calculate_shipping_cost(price: int) -> int:
+    if price < 100:
+        return 8
+    elif price <= 999:
+        return 10
+    else:
+        return 12
 
 
 # --- ساخت دیتابیس و جدول‌ها ---
@@ -192,6 +203,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS shop_requests (
                 user_id INTEGER PRIMARY KEY,
                 shop_name TEXT,
+                channel_id TEXT,
                 status TEXT DEFAULT 'PENDING',
                 requested_at TEXT
             )
@@ -201,6 +213,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS shops (
                 seller_id INTEGER PRIMARY KEY,
                 shop_name TEXT,
+                channel_id TEXT,
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TEXT
             )
@@ -254,6 +267,17 @@ async def init_db():
                 created_at TEXT
             )
         """)
+
+        # اضافه کردن ستون channel_id به جدول‌های قدیمی در صورت عدم وجود
+        try:
+            await db.execute("ALTER TABLE shop_requests ADD COLUMN channel_id TEXT")
+        except Exception:
+            pass
+
+        try:
+            await db.execute("ALTER TABLE shops ADD COLUMN channel_id TEXT")
+        except Exception:
+            pass
 
         # فقط گروه پیش‌فرض Default ثبت می‌شود
         for g in ["Default"]:
@@ -590,7 +614,7 @@ async def cmd_start(message: Message, state: FSMContext):
             if p["stock_type"] == "limited" and p["stock_qty"] <= 0:
                 return await message.reply("❌ موجودی این کالا به اتمام رسیده است.")
 
-            shipping_cost = int(p["price"] * 0.12) if p["needs_shipping"] else 0
+            shipping_cost = calculate_shipping_cost(p["price"]) if p["needs_shipping"] else 0
             total_price = p["price"] + shipping_cost
 
             caption = (
@@ -600,7 +624,7 @@ async def cmd_start(message: Message, state: FSMContext):
                 f"💰 قیمت اصل کالا: <code>₳ {p['price']}</code>\n"
             )
             if p["needs_shipping"]:
-                caption += f"🚚 هزینه پست (۱۲٪): <code>₳ {shipping_cost}</code>\n"
+                caption += f"🚚 هزینه پست: <code>₳ {shipping_cost}</code>\n"
             
             caption += f"💳 <b>مبلغ کل فاکتور: <code>₳ {total_price}</code></b>"
 
@@ -923,7 +947,7 @@ async def cb_buy_product(callback: CallbackQuery, state: FSMContext):
     if not u or u["is_frozen"]:
         return await callback.answer("❌ حساب شما فریز یا نامعتبر است.", show_alert=True)
 
-    shipping_cost = int(p["price"] * 0.12) if p["needs_shipping"] else 0
+    shipping_cost = calculate_shipping_cost(p["price"]) if p["needs_shipping"] else 0
     total_price = p["price"] + shipping_cost
 
     if u["balance"] < total_price:
@@ -1200,10 +1224,12 @@ async def cmd_shop_requests(message: Message):
             InlineKeyboardButton(text="✅ تایید درخواست", callback_data=f"app_shop_{r['user_id']}"),
             InlineKeyboardButton(text="❌ رد درخواست", callback_data=f"rej_shop_{r['user_id']}")
         ]])
+        ch_text = html.escape(r['channel_id']) if r['channel_id'] else "ثبت نشده"
         await message.reply(
             f"🏪 <b>درخواست ساخت فروشگاه</b>\n"
             f"👤 کاربر: <code>{r['user_id']}</code>\n"
             f"🏢 نام فروشگاه: <b>{html.escape(r['shop_name'])}</b>\n"
+            f"📢 کانال/گروه مقصد: <code>{ch_text}</code>\n"
             f"📅 تاریخ: {r['requested_at'][:10]}",
             reply_markup=kb, parse_mode="HTML"
         )
@@ -1220,8 +1246,8 @@ async def cb_approve_shop(callback: CallbackQuery):
         async with db.execute("SELECT * FROM shop_requests WHERE user_id = ?", (target_id,)) as cur:
             req = await cur.fetchone()
         if req:
-            await db.execute("INSERT OR REPLACE INTO shops (seller_id, shop_name, is_active, created_at) VALUES (?, ?, 1, ?)",
-                             (target_id, req["shop_name"], datetime.now(timezone.utc).isoformat()))
+            await db.execute("INSERT OR REPLACE INTO shops (seller_id, shop_name, channel_id, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
+                             (target_id, req["shop_name"], req["channel_id"], datetime.now(timezone.utc).isoformat()))
             await db.execute("UPDATE shop_requests SET status = 'APPROVED' WHERE user_id = ?", (target_id,))
             await db.commit()
 
@@ -1279,17 +1305,31 @@ async def cmd_request_shop(message: Message, state: FSMContext):
 @shop_router.message(ShopRequestForm.waiting_for_shop_name)
 async def process_shop_name(message: Message, state: FSMContext):
     shop_name = message.text.strip()
+    await state.update_data(shop_name=shop_name)
+    await message.reply(
+        "📢 لطفاً <b>آیدی کانال یا گروه</b> مقصد را وارد کنید (مثلاً <code>@MyChannel</code> یا <code>-100123456789</code>):\n"
+        "📌 <i>توجه: ربات باید در کانال/گروه مقصد دسترسی ادمین جهت ارسال پیام داشته باشد.</i>",
+        parse_mode="HTML"
+    )
+    await state.set_state(ShopRequestForm.waiting_for_channel_id)
+
+
+@shop_router.message(ShopRequestForm.waiting_for_channel_id)
+async def process_shop_channel_id(message: Message, state: FSMContext):
+    channel_id = message.text.strip()
+    data = await state.get_data()
     user_id = message.from_user.id
+    shop_name = data["shop_name"]
     await state.clear()
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO shop_requests (user_id, shop_name, status, requested_at) VALUES (?, ?, 'PENDING', ?)",
-            (user_id, shop_name, datetime.now(timezone.utc).isoformat())
+            "INSERT OR REPLACE INTO shop_requests (user_id, shop_name, channel_id, status, requested_at) VALUES (?, ?, ?, 'PENDING', ?)",
+            (user_id, shop_name, channel_id, datetime.now(timezone.utc).isoformat())
         )
         await db.commit()
 
-    await message.reply("✅ درخواست شما برای ساخت فروشگاه ثبت گردید و جهت بررسی به سوپر ادین ارسال شد.")
+    await message.reply("✅ درخواست شما برای ساخت فروشگاه ثبت گردید و جهت بررسی به سوپر ادمین ارسال شد.")
 
 
 @shop_router.message(Command("my_shop"))
@@ -1302,7 +1342,7 @@ async def cmd_my_shop(message: Message):
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT shop_name FROM shops WHERE seller_id = ?", (seller_id,)) as cur:
+        async with db.execute("SELECT shop_name, channel_id FROM shops WHERE seller_id = ?", (seller_id,)) as cur:
             s = await cur.fetchone()
         async with db.execute("SELECT COUNT(*) as cnt FROM products WHERE seller_id = ? AND is_active = 1", (seller_id,)) as cur:
             p_cnt = (await cur.fetchone())["cnt"]
@@ -1311,9 +1351,11 @@ async def cmd_my_shop(message: Message):
 
     sales_cnt = stats["sales"] or 0
     revenue = stats["rev"] or 0
+    ch_info = html.escape(s['channel_id']) if s and s['channel_id'] else "ثبت نشده"
 
     await message.reply(
         f"🏢 <b>داشبورد فروشگاه «{html.escape(s['shop_name'])}»</b>\n\n"
+        f"📢 کانال/گروه ثبت‌شده: <code>{ch_info}</code>\n"
         f"📦 تعداد محصولات فعال: <code>{p_cnt}</code>\n"
         f"🛒 تعداد فروش‌های موفق: <code>{sales_cnt}</code>\n"
         f"💰 کل درآمد از فروش: <code>₳ {revenue}</code>\n\n"
@@ -1386,13 +1428,20 @@ async def process_prod_desc(message: Message, state: FSMContext):
 async def process_prod_price(message: Message, state: FSMContext):
     if not message.text.isdigit() or int(message.text) <= 0:
         return await message.reply("❌ قیمت باید یک عدد مثبت باشد.")
-    await state.update_data(price=int(message.text))
+    
+    price = int(message.text)
+    ship_fee = calculate_shipping_cost(price)
+    await state.update_data(price=price)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚚 بله (نیازمند ارسال پستی)", callback_data="ship_yes"),
+        InlineKeyboardButton(text=f"🚚 بله ({ship_fee} آتر هزینه پست)", callback_data="ship_yes"),
         InlineKeyboardButton(text="⚡ خیر (دیجیتالی / تحویل فوری)", callback_data="ship_no")
     ]])
-    await message.reply("🚚 <b>مرحله ۵ از ۷:</b> آیا این کالا نیاز به ارسال پستی/فیزیکی دارد؟\n(در صورت تایید، ۱۲٪ هزینه پست خودکار روی فاکتور خریدار محاسبه می‌شود)", reply_markup=kb, parse_mode="HTML")
+    await message.reply(
+        f"🚚 <b>مرحله ۵ از ۷:</b> آیا این کالا نیاز به ارسال پستی/فیزیکی دارد؟\n"
+        f"(هزینه ارسال محاسبه‌شده برای این محصول: <code>₳ {ship_fee}</code>)", 
+        reply_markup=kb, parse_mode="HTML"
+    )
     await state.set_state(AddProductForm.waiting_for_shipping)
 
 
@@ -1439,7 +1488,8 @@ async def show_product_preview(message: Message, state: FSMContext):
         InlineKeyboardButton(text="❌ لغو", callback_data="pub_prod_no")
     ]])
 
-    sh_text = "دارد (۱۲٪ هزینه پست)" if data["needs_shipping"] else "ندارد"
+    ship_fee = calculate_shipping_cost(data["price"])
+    sh_text = f"دارد (₳ {ship_fee} هزینه پست)" if data["needs_shipping"] else "ندارد"
     preview_txt = (
         f"🔍 <b>مرحله ۷ از ۷: پیش‌نمایش و تایید انتشار محصول</b>\n\n"
         f"📦 نام کالا: <b>{html.escape(data['name'])}</b>\n"
@@ -1465,6 +1515,10 @@ async def cb_publish_product(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT shop_name, channel_id FROM shops WHERE seller_id = ?", (seller_id,)) as cur:
+            shop_info = await cur.fetchone()
+
         cursor = await db.execute("""
             INSERT INTO products (seller_id, photo_id, name, description, price, needs_shipping, stock_type, stock_qty, is_active, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
@@ -1475,12 +1529,47 @@ async def cb_publish_product(callback: CallbackQuery, state: FSMContext):
     bot_info = await callback.bot.get_me()
     buy_link = f"https://t.me/{bot_info.username}?start=prod_{product_id}"
 
-    await callback.message.edit_text(
+    # متن آماده جهت آپلود و پست شدن در کانال یا گروه فروشگاه
+    ship_fee = calculate_shipping_cost(data["price"])
+    post_caption = (
+        f"🛍️ <b>محصول جدید در فروشگاه {html.escape(shop_info['shop_name'] if shop_info else 'بانک')}</b>\n\n"
+        f"📦 <b>{html.escape(data['name'])}</b>\n"
+        f"📝 {html.escape(data['description'])}\n\n"
+        f"💰 قیمت: <code>₳ {data['price']}</code>\n"
+    )
+    if data["needs_shipping"]:
+        post_caption += f"🚚 هزینه پست: <code>₳ {ship_fee}</code>\n"
+
+    post_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🛒 خرید آنلاین / سریع", url=buy_link)
+    ]])
+
+    channel_posted = False
+    if shop_info and shop_info["channel_id"]:
+        try:
+            target_ch = shop_info["channel_id"].strip()
+            if target_ch.isdigit() or target_ch.startswith("-"):
+                target_ch = int(target_ch)
+            
+            if data.get("photo_id"):
+                await callback.bot.send_photo(chat_id=target_ch, photo=data["photo_id"], caption=post_caption, reply_markup=post_kb, parse_mode="HTML")
+            else:
+                await callback.bot.send_message(chat_id=target_ch, text=post_caption, reply_markup=post_kb, parse_mode="HTML")
+            channel_posted = True
+        except Exception as e:
+            logging.error(f"Error publishing product to shop channel/group: {e}")
+
+    res_msg = (
         f"🎉 <b>محصول شما با موفقیت منتشر شد!</b>\n\n"
         f"🆔 شناسه کالا: <code>{product_id}</code>\n"
-        f"🔗 <b>لینک خرید مستقیم از کانال:</b>\n{buy_link}",
-        parse_mode="HTML"
+        f"🔗 <b>لینک خرید مستقیم از کانال:</b>\n{buy_link}\n\n"
     )
+    if channel_posted:
+        res_msg += f"📲 پست مربوط به محصول با موفقیت در کانال/گروه <code>{html.escape(str(shop_info['channel_id']))}</code> قرار گرفت."
+    else:
+        res_msg += "⚠️ پیام محصول در کانال/گروه ارسال نشد. مطمئن شوید ربات در کانال/گروه مقصد ادمین باشد."
+
+    await callback.message.edit_text(res_msg, parse_mode="HTML")
 
 
 @shop_router.callback_query(AddProductForm.waiting_for_confirm, F.data == "pub_prod_no")
@@ -2481,281 +2570,128 @@ async def cmd_remove_super(message: Message):
         await db.commit()
         await load_super_admins(db)
 
-    await message.reply(f"✅ کاربر <code>{rem_id}</code> از سوپرادمین‌ها حذف شد.", parse_mode="HTML")
+    await message.reply(f"🔥 دسترسی سوپرادمین کاربر <code>{rem_id}</code> سلب شد.", parse_mode="HTML")
 
 
 @admin_router.message(Command("freeze"))
 async def cmd_freeze(message: Message):
-    if not is_super_admin(message.from_user.id):
-        return await message.reply("❌ این دستور فقط مخصوص سوپرادمین است.")
+    if not is_private(message) or not await check_admin_filter(message):
+        return
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("استفاده: <code>/freeze [آیدی]</code>", parse_mode="HTML")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET is_frozen = 1 WHERE user_id = ?", (int(args[1]),)
+            "UPDATE users SET is_frozen = 1 WHERE user_id = ?",
+            (int(args[1]),),
         )
         await db.commit()
-    await message.reply("❄️ حساب کاربر فریز شد.")
+    await message.reply("❄️ حساب مسدود شد.")
 
 
 @admin_router.message(Command("unfreeze"))
 async def cmd_unfreeze(message: Message):
-    if not is_super_admin(message.from_user.id):
-        return await message.reply("❌ این دستور فقط مخصوص سوپرادمین است.")
+    if not is_private(message) or not await check_admin_filter(message):
+        return
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("استفاده: <code>/unfreeze [آیدی]</code>", parse_mode="HTML")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET is_frozen = 0 WHERE user_id = ?", (int(args[1]),)
+            "UPDATE users SET is_frozen = 0 WHERE user_id = ?",
+            (int(args[1]),),
         )
         await db.commit()
-    await message.reply("🟢 حساب کاربر فعال شد.")
+    await message.reply("🔓 حساب فعال شد.")
 
 
-@admin_router.message(Command("check"))
-async def cmd_check(message: Message):
-    if not is_super_admin(message.from_user.id):
-        return await message.reply("❌ این دستور فقط مخصوص سوپرادمین است.")
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply("استفاده: <code>/check [آیدی]</code>", parse_mode="HTML")
-    u = await get_user_data(int(args[1]))
-    if u:
-        status = "❄️ فریز شده" if u["is_frozen"] else "🟢 فعال"
-        admin_st = "👑 ادمین" if u["is_admin"] else "👤 کاربر عادی"
-        safe_full_name = html.escape(u['full_name'] or 'ناشناس')
-        safe_username = html.escape(u['username'] or 'بدون آیدی')
-        safe_group_name = html.escape(u['group_name'] or 'Default')
-        await message.reply(
-            f"🔎 <b>اطلاعات کامل کاربر <code>{args[1]}</code>:</b>\n\n"
-            f"👤 نام کامل: {safe_full_name}\n"
-            f"🏷 نام کاربری: @{safe_username}\n"
-            f"💰 موجودی: <code>₳ {u['balance']}</code>\n"
-            f"👥 گروه: <b>{safe_group_name}</b>\n"
-            f"⚡ وضعیت: {status}\n"
-            f"🛡 دسترسی: {admin_st}",
-            parse_mode="HTML",
-        )
-
-
-# --- دستور صفر کردن دیتابیس و ری‌استارت ---
-
-
-@admin_router.message(Command("reset_all"))
-async def cmd_reset_all(message: Message, state: FSMContext):
+@admin_router.message(Command("backup"))
+async def cmd_backup(message: Message):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
 
+    backup_file = create_zip_backup(prefix="manual")
+    if backup_file and os.path.exists(backup_file):
+        file_input = FSInputFile(backup_file)
+        await message.reply_document(
+            document=file_input, caption="📦 فایل پشتیبان دستی بانک جادویی Atramentum"
+        )
+    else:
+        await message.reply("❌ خطا در ایجاد فایل پشتیبان.")
+
+
+@admin_router.message(Command("reset_system"))
+async def cmd_reset_system(message: Message, state: FSMContext):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="💣 بله، دیتابیس کاملاً پاک شود", callback_data="reset_yes"),
-            InlineKeyboardButton(text="❌ انصراف", callback_data="reset_no"),
+            InlineKeyboardButton(
+                text="💣 بله، دیتابیس را ریست کن", callback_data="reset_yes"
+            ),
+            InlineKeyboardButton(text="❌ خیر", callback_data="reset_no"),
         ]]
     )
     await message.reply(
-        "⚠️ <b>هشدار بسیار مهم!</b>\n\n"
-        "آیا مطمئن هستید؟ این دستور تمام داده‌ها، کاربران، گروه‌ها و تراکنش‌ها را <b>حذف کاملاً دائم</b> می‌کند و دیتابیس صفر خواهد شد.\n\n"
-        "آیا قصد ادامه دارید؟",
+        "⚠️ <b>اخطار بسیار مهم!</b>\nآیا از ریست کامل دیتابیس اطمینان دارید؟",
         reply_markup=kb,
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     await state.set_state(ResetForm.waiting_for_confirm)
 
 
-@admin_router.callback_query(ResetForm.waiting_for_confirm, F.data == "reset_yes")
-async def cb_reset_yes(callback: CallbackQuery, state: FSMContext):
+@admin_router.callback_query(
+    ResetForm.waiting_for_confirm, F.data == "reset_yes"
+)
+async def reset_yes_cb(callback: CallbackQuery, state: FSMContext):
     if not is_super_admin(callback.from_user.id):
-        return await callback.answer("❌ عدم دسترسی.", show_alert=True)
+        return await callback.answer("عدم دسترسی.", show_alert=True)
 
     await state.clear()
-    await callback.message.edit_text("⏳ در حال حذف دیتابیس و ری‌ست کردن سیستم...")
+    create_zip_backup(prefix="pre_reset")
 
     async with db_lock:
         if os.path.exists(DB_PATH):
-            try:
-                os.remove(DB_PATH)
-            except Exception as e:
-                return await callback.message.edit_text(f"❌ خطا در حذف فایل دیتابیس: {e}")
-
+            os.remove(DB_PATH)
         await init_db()
 
-    await callback.message.edit_text("💥 <b>دیتابیس با موفقیت صفر شد و ربات ری‌ست گردید!</b>", parse_mode="HTML")
-
-
-@admin_router.callback_query(ResetForm.waiting_for_confirm, F.data == "reset_no")
-async def cb_reset_no(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("❌ عملیات صفر کردن دیتابیس لغو شد.")
-
-
-# --- دستورات بکاپ‌گیری دستی و بازیابی ---
-
-
-@admin_router.message(Command("backup_now"))
-async def cmd_backup_now(message: Message):
-    if not is_private(message) or not is_super_admin(message.from_user.id):
-        return
-
-    zip_path = create_zip_backup("manual")
-    if zip_path and os.path.exists(zip_path):
-        await message.reply_document(
-            FSInputFile(zip_path), caption="<b>📦 فایل بکاپ کامل دیتابیس (ZIP)</b>", parse_mode="HTML"
-        )
-    else:
-        await message.reply("❌ خطا در ایجاد فایل بکاپ.")
-
-
-@admin_router.message(Command("force_backup"))
-async def cmd_force_backup(message: Message):
-    if not is_private(message) or not is_super_admin(message.from_user.id):
-        return
-
-    if os.path.exists(DB_PATH):
-        try:
-            await message.bot.send_document(
-                chat_id=BACKUP_CHANNEL_ID,
-                document=FSInputFile(DB_PATH),
-                caption=f"<b>📦 بکاپ دستی دیتابیس (توسط سوپرادمین)</b>\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                parse_mode="HTML"
-            )
-            await message.reply("✅ فایل دیتابیس با موفقیت به کانال تلگرام بکاپ ارسال شد.")
-        except Exception as e:
-            await message.reply(f"❌ خطا در ارسال بکاپ به کانال: {e}")
-    else:
-        await message.reply("❌ فایل دیتابیس یافت نشد.")
-
-
-@admin_router.message(Command("restore"))
-async def cmd_restore(message: Message):
-    if not is_private(message) or not is_super_admin(message.from_user.id):
-        return
-
-    if not message.reply_to_message or not message.reply_to_message.document:
-        return await message.reply(
-            "❌ لطفاً این دستور را در **ریپلای (Reply)** روی یک فایل بکاپ ZIP"
-            " یا db ارسال کنید."
-        )
-
-    doc = message.reply_to_message.document
-    file_info = await message.bot.get_file(doc.file_id)
-    download_path = f"temp_restore_{doc.file_name}"
-
-    await message.bot.download_file(file_info.file_path, download_path)
-
-    try:
-        if download_path.endswith(".zip"):
-            with zipfile.ZipFile(download_path, "r") as zip_ref:
-                zip_ref.extractall("temp_extract")
-            extracted_db = os.path.join("temp_extract", "atr_bank.db")
-            if os.path.exists(extracted_db):
-                shutil.move(extracted_db, DB_PATH)
-                shutil.rmtree("temp_extract")
-            else:
-                os.remove(download_path)
-                return await message.reply("❌ فایل `atr_bank.db` در فایل زیپ یافت نشد.")
-        else:
-            shutil.move(download_path, DB_PATH)
-
-        if os.path.exists(download_path):
-            os.remove(download_path)
-
-        await message.reply(
-            "<b>✅ پایگاه‌داده با موفقیت بازیابی شد!</b> ربات آماده به کار است.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await message.reply(f"❌ خطا در بازیابی دیتابیس: {e}")
-
-
-# --- راهنمای دستورات ---
-
-
-@user_router.message(Command("help"))
-@user_router.message(F.text == "راهنمای جامع بانک")
-async def cmd_help(message: Message):
-    user_id = message.from_user.id
-    is_sa = is_super_admin(user_id)
-    u = await get_user_data(user_id)
-    is_adm = u and u["is_admin"]
-
-    txt = (
-        "📱 <b>راهنمای دستورات کاربران و خریداران:</b>\n"
-        "🔹 <code>/start</code> - شروع و دریافت شماره حساب\n"
-        "🔹 <code>/profile</code> یا «پروفایل» - مشاهده مشخصات و موجودی\n"
-        "🔹 <code>/transfer</code> یا «انتقال آتر» - انتقال آتر\n"
-        "🔹 <code>/my_orders</code> - پیگیری سفارش‌های جاری و کد ۱۰ رقمی\n"
-        "🔹 <code>/my_purchases</code> - کتابخانه و آرشیو کامل خریدهای من\n\n"
-        "🏪 <b>دستورات فروشندگان:</b>\n"
-        "🔸 <code>/request_shop</code> - ارسال درخواست افتتاح فروشگاه\n"
-        "🔸 <code>/my_shop</code> - داشبورد و آمار فروشگاه\n"
-        "🔸 <code>/add_product</code> - ثبت محصول جدید (۷ مرحله‌ای)\n"
-        "🔸 <code>/inventory</code> - مدیریت انبار و موجودی کالاها\n"
-        "🔸 <code>/shop_rates</code> - مشاهده درصدهای فعال سیستم\n\n"
-        "🛵 <b>دستورات پستچی / پیک:</b>\n"
-        "🔹 <code>/courier_orders</code> - مشاهده مرسولات در انتظار تحویل\n"
-        "🔹 <code>/confirm_delivery [کد_۱۰_رقمی]</code> - تایید تحویل و دریافت سهم\n"
-        "🔹 <code>/delivery_rates</code> - مشاهده درصدهای سهم پستچی\n\n"
+    await callback.message.edit_text(
+        "💣 دیتابیس ریست شد. تمام حساب‌ها و اطلاعات پاک شدند."
     )
 
-    if is_adm or is_sa:
-        txt += (
-            "👥 <b>دستورات ادمین (فقط پیوی):</b>\n"
-            "🔹 <code>/users</code> - لیست کاربران\n"
-            "🔹 <code>/groups</code> - لیست گروه‌ها\n"
-            "🔹 <code>/group_users [نام]</code> - اعضای یک گروه\n"
-            "🔹 <code>/create_group [نام]</code> - اضافه کردن گروه\n"
-            "🔹 <code>/add_group [نام]</code> - ساخت گروه مجازی + لینک دعوت\n"
-            "🔹 <code>/extend_group [نام] [روز]</code> - تمدید لینک گروه\n"
-            "🔹 <code>/renew_group [نام] [روز]</code> - ساخت لینک جدید\n"
-            "🔹 <code>/rename_group [قدیمی] [جدید]</code> - تغییر نام گروه\n"
-            "🔹 <code>/move_group [آیدی] [گروه]</code> - تغییر گروه کاربر\n"
-            "🔹 <code>/remove_group [آیدی]</code> - برگرداندن به Default\n\n"
-        )
 
-    if is_sa:
-        txt += (
-            "👑 <b>دستورات سوپرادمین (فقط پیوی):</b>\n"
-            "🔸 <code>/set_shop_rates [فروشنده] [خزانه] [مالیات]</code> - تنظیم درصد کالا\n"
-            "🔸 <code>/set_courier_rates [پستچی] [خزانه] [مالیات]</code> - تنظیم درصد پست\n"
-            "🔸 <code>/add_courier [آیدی]</code> و <code>/remove_courier</code> - مدیریت پستچی‌ها\n"
-            "🔸 <code>/shop_requests</code> - مدیریت درخواست‌های فروشگاه\n"
-            "🔸 <code>/remove_shop [آیدی]</code> - غیرفعال‌سازی فروشگاه\n"
-            "🔸 <code>/give [آیدی] [مقدار]</code> - واریز مدیریتی\n"
-            "🔸 <code>/take [آیدی] [مقدار]</code> - کسر مدیریتی\n"
-            "🔸 <code>/rewardgroup [گروه] [مقدار]</code> - پاداش گروهی\n"
-            "🔸 <code>/undo [شناسه]</code> - برگشت تراکنش\n"
-            "🔸 <code>/economy</code> - آمار اقتصاد\n"
-            "🔸 <code>/check [آیدی]</code> - اطلاعات کامل کاربر\n"
-            "🔸 <code>/promote</code> و <code>/demote</code> - ارتقا/عزل ادمین\n"
-            "🔸 <code>/list_admins</code> - مشاهده لیست ادمین‌ها\n"
-            "🔸 <code>/add_super</code> و <code>/remove_super</code> - مدیریت سوپرادمین‌ها\n"
-            "🔸 <code>/freeze</code> و <code>/unfreeze</code> - مسدود/فعال‌سازی حساب\n"
-            "🔸 <code>/backup_now</code> - بکاپ ZIP\n"
-            "🔸 <code>/force_backup</code> - ارسال بکاپ به کانال\n"
-            "🔸 <code>/restore</code> - بازیابی دیتابیس\n"
-            "🔸 <code>/reset_all</code> - پاکسازی کامل دیتابیس\n"
-        )
-
-    await message.reply(txt, parse_mode="HTML")
+@admin_router.callback_query(
+    ResetForm.waiting_for_confirm, F.data == "reset_no"
+)
+async def reset_no_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ عملیات ریست لغو شد.")
 
 
+# --- شروع به کار ربات ---
 async def main():
-    bot = Bot(token=BOT_TOKEN)
+    if not BOT_TOKEN:
+        logging.error("❌ توکن ربات یافت نشد! BOT_TOKEN را تنظیم کنید.")
+        return
 
-    await start_dummy_server()
-    await restore_db_from_telegram(bot)
     await init_db()
+    bot = Bot(token=BOT_TOKEN)
+    
+    # بازیابی خودکار دیتابیس در هنگام استارت آپ Render
+    await restore_db_from_telegram(bot)
 
-    asyncio.create_task(auto_backup_loop(bot))
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
 
-    dp = Dispatcher(storage=MemoryStorage())
-
+    dp.include_router(user_router)
     dp.include_router(admin_router)
     dp.include_router(shop_router)
-    dp.include_router(user_router)
 
+    # اجرای همزمان وب سرور ساختگی Render و حلقه بکاپ خودکار
+    asyncio.create_task(start_dummy_server())
+    asyncio.create_task(auto_backup_loop(bot))
+
+    logging.info("🚀 Bot started successfully...")
     await dp.start_polling(bot)
 
 
