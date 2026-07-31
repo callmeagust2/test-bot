@@ -467,7 +467,7 @@ async def cmd_profile(message: Message):
     )
 
 
-# --- سیستم انتقال آتر (چند روشه) ---
+# --- سیستم انتقال آتر (روش‌های درخواستی جدید) ---
 
 async def process_transfer_request(message: Message, state: FSMContext, to_user_id: int, amount: int):
     """تابع کمکی برای شروع تأیید انتقال"""
@@ -518,97 +518,80 @@ async def cmd_transfer(message: Message, state: FSMContext):
         return await message.reply("❌ حساب شما مسدود (فریز) است.")
 
     text = message.text.strip()
+    
+    # حذف کلمات ابتدایی دستور
     if text.startswith("/transfer"):
         text = text[len("/transfer"):].strip()
     elif text.startswith("انتقال آتر"):
         text = text[len("انتقال آتر"):].strip()
 
+    # راهنما در صورت عدم وارد کردن آرگومان
+    if not text and not message.reply_to_message:
+        return await message.reply(
+            "📖 <b>روش‌های انتقال آتر:</b>\n\n"
+            "1️⃣ <b>انتقال با آیدی عددی:</b>\n"
+            "<code>انتقال آتر 123456789 500</code>\n\n"
+            "2️⃣ <b>انتقال با نام کاربری:</b>\n"
+            "<code>انتقال آتر @username 500</code>\n\n"
+            "3️⃣ <b>انتقال با ریپلای روی پیام فرد:</b>\n"
+            "ریپلای روی پیام شخص و نوشتن: <code>انتقال آتر 500</code>",
+            parse_mode="HTML"
+        )
+
+    # حالت سوم: ریپلای روی پیام فرد
     if message.reply_to_message and message.reply_to_message.from_user:
         try:
             amount = int(text)
             to_user_id = message.reply_to_message.from_user.id
             return await process_transfer_request(message, state, to_user_id, amount)
         except ValueError:
-            return await message.reply("❌ مبلغ باید عدد باشد.")
+            return await message.reply("❌ مبلغ وارد شده نامعتبر است. مبلغ باید یک عدد باشد.")
 
+    # حالت اول و دوم: بر اساس آیدی عددی یا یوزرنیم
     parts = text.split()
-    if len(parts) == 0:
-        await message.reply("لطفاً شماره حساب (آیدی عددی) فرد مقصد را وارد کنید:")
-        await state.set_state(TxForm.waiting_for_to_user)
-        return
+    if len(parts) < 2:
+        return await message.reply(
+            "❌ فرمت دستور اشتباه است.\nمثال: <code>انتقال آتر @username 100</code> یا <code>انتقال آتر 123456 100</code>",
+            parse_mode="HTML"
+        )
 
-    if len(parts) >= 2:
-        target_raw = parts[0]
-        try:
-            amount = int(parts[1])
-        except ValueError:
-            return await message.reply("❌ مبلغ باید عدد باشد.")
+    target_raw = parts[0]
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return await message.reply("❌ مبلغ باید عدد باشد.")
 
-        to_user_id = None
-        if target_raw.startswith("@"):
-            username = target_raw[1:]
+    to_user_id = None
+    if target_raw.startswith("@"):
+        username = target_raw[1:]
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT user_id FROM users WHERE username = ?",
+                (username,),
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    to_user_id = row["user_id"]
+        if not to_user_id:
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute(
-                    "SELECT user_id FROM users WHERE username = ?",
-                    (username,),
+                    "SELECT user_id FROM users WHERE username LIKE ?",
+                    (f"%{username}%",),
                 ) as cur:
                     row = await cur.fetchone()
                     if row:
                         to_user_id = row["user_id"]
-            if not to_user_id:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    db.row_factory = aiosqlite.Row
-                    async with db.execute(
-                        "SELECT user_id FROM users WHERE username LIKE ?",
-                        (f"%{username}%",),
-                    ) as cur:
-                        row = await cur.fetchone()
-                        if row:
-                            to_user_id = row["user_id"]
-            if not to_user_id:
-                return await message.reply("❌ کاربری با این آیدی یافت نشد.")
-        else:
-            try:
-                to_user_id = int(target_raw)
-            except ValueError:
-                return await message.reply("❌ شماره حساب باید عدد باشد.")
+        if not to_user_id:
+            return await message.reply("❌ کاربری با این آیدی یافت نشد.")
+    else:
+        try:
+            to_user_id = int(target_raw)
+        except ValueError:
+            return await message.reply("❌ شماره حساب (آیدی عددی) یا نام کاربری وارد شده نامعتبر است.")
 
-        return await process_transfer_request(message, state, to_user_id, amount)
-
-    try:
-        to_user_id = int(parts[0])
-        await state.update_data(to_user_id=to_user_id)
-        await message.reply("مبلغ را وارد کنید:")
-        await state.set_state(TxForm.waiting_for_amount)
-    except ValueError:
-        await message.reply("لطفاً شماره حساب (آیدی عددی) فرد مقصد را وارد کنید:")
-        await state.set_state(TxForm.waiting_for_to_user)
-
-
-@user_router.message(TxForm.waiting_for_to_user)
-async def process_to_user(message: Message, state: FSMContext):
-    try:
-        to_user_id = int(message.text.strip())
-    except ValueError:
-        return await message.reply("❌ شماره حساب باید عدد باشد. دوباره وارد کنید:")
-    await state.update_data(to_user_id=to_user_id)
-    await message.reply("مبلغ را وارد کنید:")
-    await state.set_state(TxForm.waiting_for_amount)
-
-
-@user_router.message(TxForm.waiting_for_amount)
-async def process_amount(message: Message, state: FSMContext):
-    try:
-        amount = int(message.text.strip())
-    except ValueError:
-        return await message.reply("❌ مبلغ باید عدد باشد. دوباره وارد کنید:")
-    data = await state.get_data()
-    to_user_id = data.get("to_user_id")
-    if not to_user_id:
-        await state.clear()
-        return await message.reply("❌ خطا. دوباره از اول شروع کنید.")
-    await process_transfer_request(message, state, to_user_id, amount)
+    return await process_transfer_request(message, state, to_user_id, amount)
 
 
 @user_router.callback_query(TxForm.waiting_for_confirm, F.data == "tx_yes")
