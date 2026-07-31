@@ -76,7 +76,6 @@ class AddProductForm(StatesGroup):
     waiting_for_desc = State()
     waiting_for_price = State()
     waiting_for_needs_shipping = State()
-    waiting_for_shipping_price = State()
     waiting_for_stock_type = State()
     waiting_for_stock_count = State()
     waiting_for_photo = State()
@@ -467,14 +466,16 @@ async def cmd_start(message: Message):
                     InlineKeyboardButton(text="🛒 تایید و خرید محصول", callback_data=f"confirm_buy_{product_id}")
                 ]])
 
-                ship_text = f"<code>₳ {product['shipping_price']:,}</code>" if product["needs_shipping"] else "بدون نیاز به پست"
+                ship_text = "نیازمند پست 🚚" if product["needs_shipping"] else "بدون نیاز به پست"
+                stock_text = "نامحدود" if product["stock_type"] == "UNLIMITED" else f"{product['stock_count']} عدد"
 
                 caption = (
                     f"🛒 <b>{html.escape(product['title'])}</b>\n\n"
                     f"🏪 فروشگاه: <b>{html.escape(product['shop_name'])}</b>\n"
                     f"📝 توضیحات: {html.escape(product['description'] or 'ندارد')}\n"
                     f"💰 قیمت کالا: <code>₳ {product['price']:,}</code>\n"
-                    f"🚚 هزینه پست: {ship_text}\n"
+                    f"📦 موجودی: <b>{stock_text}</b>\n"
+                    f"🚚 وضعیت ارسال: {ship_text}\n"
                 )
 
                 if product["photo_id"]:
@@ -940,7 +941,6 @@ async def cmd_register_shop(message: Message):
         parse_mode="HTML"
     )
 
-    # پنل شیشه‌ای جهت تأیید یا رد شاپ توسط سوپرادمین
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ تأیید شاپ", callback_data=f"approve_shop:{shop_id}"),
         InlineKeyboardButton(text="❌ رد شاپ", callback_data=f"reject_shop:{shop_id}")
@@ -1094,51 +1094,33 @@ async def process_prod_price(message: Message, state: FSMContext):
 @shop_router.callback_query(AddProductForm.waiting_for_needs_shipping, F.data.startswith("ship_"))
 async def process_prod_needs_shipping(callback: CallbackQuery, state: FSMContext):
     needs_ship = 1 if callback.data == "ship_yes" else 0
-    await state.update_data(needs_shipping=needs_ship)
+    await state.update_data(needs_shipping=needs_ship, shipping_price=0)
 
-    if needs_ship == 1:
-        await callback.message.edit_text("🚚 لطفاً **هزینه پست (به آتر)** را وارد کنید:")
-        await state.set_state(AddProductForm.waiting_for_shipping_price)
-    else:
-        await state.update_data(shipping_price=0)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="نامحدود", callback_data="stock_UNLIMITED"),
-            InlineKeyboardButton(text="محدود (تعداد مشخص)", callback_data="stock_LIMITED")
-        ]])
-        await callback.message.edit_text("📊 نوع موجودی محصول را انتخاب کنید:", reply_markup=kb)
-        await state.set_state(AddProductForm.waiting_for_stock_type)
-
-
-@shop_router.message(AddProductForm.waiting_for_shipping_price)
-async def process_prod_shipping_price(message: Message, state: FSMContext):
-    try:
-        ship_price = int(message.text.strip())
-        if ship_price < 0:
-            raise ValueError
-    except ValueError:
-        return await message.reply("❌ هزینه پست باید عدد صحیح غیرمنفی باشد.")
-
-    await state.update_data(shipping_price=ship_price)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="نامحدود", callback_data="stock_UNLIMITED"),
-        InlineKeyboardButton(text="محدود (تعداد مشخص)", callback_data="stock_LIMITED")
+        InlineKeyboardButton(text="تک عددی", callback_data="stock_SINGLE"),
+        InlineKeyboardButton(text="محدود", callback_data="stock_LIMITED")
     ]])
-    await message.reply("📊 نوع موجودی محصول را انتخاب کنید:", reply_markup=kb)
+    await callback.message.edit_text("📊 نوع موجودی محصول را انتخاب کنید:", reply_markup=kb)
     await state.set_state(AddProductForm.waiting_for_stock_type)
 
 
 @shop_router.callback_query(AddProductForm.waiting_for_stock_type, F.data.startswith("stock_"))
 async def process_prod_stock_type(callback: CallbackQuery, state: FSMContext):
-    stock_type = callback.data.split("_")[1]
-    await state.update_data(stock_type=stock_type)
+    stock_choice = callback.data.split("_")[1]
 
-    if stock_type == "LIMITED":
-        await callback.message.edit_text("🔢 تعداد موجودی کالا را وارد کنید:")
-        await state.set_state(AddProductForm.waiting_for_stock_count)
-    else:
-        await state.update_data(stock_count=0)
+    if stock_choice == "UNLIMITED":
+        await state.update_data(stock_type="UNLIMITED", stock_count=0)
         await callback.message.edit_text("🖼 عکس محصول را ارسال کنید (یا کلمه `no` را بفرستید):")
         await state.set_state(AddProductForm.waiting_for_photo)
+    elif stock_choice == "SINGLE":
+        await state.update_data(stock_type="LIMITED", stock_count=1)
+        await callback.message.edit_text("🖼 عکس محصول را ارسال کنید (یا کلمه `no` را بفرستید):")
+        await state.set_state(AddProductForm.waiting_for_photo)
+    elif stock_choice == "LIMITED":
+        await state.update_data(stock_type="LIMITED")
+        await callback.message.edit_text("🔢 تعداد موجودی کالا را وارد کنید:")
+        await state.set_state(AddProductForm.waiting_for_stock_count)
 
 
 @shop_router.message(AddProductForm.waiting_for_stock_count)
@@ -1180,19 +1162,21 @@ async def process_prod_photo(message: Message, state: FSMContext):
                 data.get("stock_count", 0),
                 photo_id,
                 data.get("needs_shipping", 0),
-                data.get("shipping_price", 0)
+                0
             ))
             product_id = cursor.lastrowid
             await db.commit()
 
-    ship_info = f"<code>₳ {data.get('shipping_price', 0):,}</code>" if data.get("needs_shipping") else "بدون پست"
+    stock_info = "نامحدود" if data["stock_type"] == "UNLIMITED" else f"{data.get('stock_count', 1)} عدد"
+    ship_info = "نیازمند پست 🚚" if data.get("needs_shipping") else "بدون نیاز به پست"
 
     await message.reply(
         f"✅ <b>محصول با موفقیت ثبت شد!</b>\n\n"
         f"📦 شناسه کالا: <code>{product_id}</code>\n"
         f"🏷 عنوان: <b>{html.escape(data['title'])}</b>\n"
         f"💰 قیمت کالا: <code>₳ {data['price']:,}</code>\n"
-        f"🚚 هزینه ارسال: {ship_info}\n\n"
+        f"📊 موجودی: <b>{stock_info}</b>\n"
+        f"🚚 وضعیت ارسال: {ship_info}\n\n"
         f"💡 برای انتشار در کانال از دستور زیر استفاده کنید:\n"
         f"<code>/post_product {product_id}</code>",
         parse_mode="HTML"
@@ -1229,14 +1213,16 @@ async def cmd_post_product(message: Message):
         InlineKeyboardButton(text="🛒 خرید مستقیم", url=buy_link)
     ]])
 
-    ship_text = f"<code>₳ {product['shipping_price']:,}</code>" if product["needs_shipping"] else "بدون نیاز به پست"
+    ship_text = "نیازمند پست 🚚" if product["needs_shipping"] else "بدون نیاز به پست"
+    stock_text = "نامحدود" if product["stock_type"] == "UNLIMITED" else f"{product['stock_count']} عدد"
 
     caption = (
         f"🛍️ <b>{html.escape(product['title'])}</b>\n\n"
         f"🏪 فروشگاه: <b>{html.escape(product['shop_name'])}</b>\n"
         f"📝 {html.escape(product['description'] or 'بدون توضیحات')}\n\n"
         f"💰 قیمت کالا: <code>₳ {product['price']:,}</code>\n"
-        f"🚚 هزینه پست: {ship_text}"
+        f"📦 موجودی: <b>{stock_text}</b>\n"
+        f"🚚 وضعیت ارسال: {ship_text}"
     )
 
     if product["photo_id"]:
@@ -1279,21 +1265,16 @@ async def cb_confirm_buy(callback: CallbackQuery):
                 return await callback.answer("❌ حساب شما مسدود (فریز) است.", show_alert=True)
 
             product_price = p["price"]
-            shipping_price = p["shipping_price"] if p["needs_shipping"] else 0
-            total_price = product_price + shipping_price
+            total_price = product_price
 
             if buyer["balance"] < total_price:
                 await db.execute("ROLLBACK")
                 return await callback.answer("❌ موجودی حساب شما برای خرید این کالا کافی نیست.", show_alert=True)
 
             seller_pct, treasury_pct, tax_pct = await get_shop_rates()
-            c_pct, c_treasury_pct, c_tax_pct = await get_courier_rates()
 
             seller_share = (product_price * seller_pct) // 100
-            prod_treasury_share = (product_price * treasury_pct) // 100
-
-            ship_treasury_share = (shipping_price * c_treasury_pct) // 100 if shipping_price > 0 else 0
-            total_treasury_share = prod_treasury_share + ship_treasury_share
+            total_treasury_share = (product_price * treasury_pct) // 100
 
             seller_id = p["seller_id"]
 
@@ -2551,125 +2532,3 @@ async def cmd_restore(message: Message):
             "❌ لطفاً این دستور را در **ریپلای (Reply)** روی یک فایل بکاپ ZIP"
             " یا db ارسال کنید."
         )
-
-    doc = message.reply_to_message.document
-    file_info = await message.bot.get_file(doc.file_id)
-    download_path = f"temp_restore_{doc.file_name}"
-
-    await message.bot.download_file(file_info.file_path, download_path)
-
-    try:
-        if download_path.endswith(".zip"):
-            with zipfile.ZipFile(download_path, "r") as zip_ref:
-                zip_ref.extractall("temp_extract")
-            extracted_db = os.path.join("temp_extract", "atr_bank.db")
-            if os.path.exists(extracted_db):
-                shutil.move(extracted_db, DB_PATH)
-                shutil.rmtree("temp_extract")
-            else:
-                os.remove(download_path)
-                return await message.reply("❌ فایل `atr_bank.db` در فایل زیپ یافت نشد.")
-        else:
-            shutil.move(download_path, DB_PATH)
-
-        if os.path.exists(download_path):
-            os.remove(download_path)
-
-        await message.reply(
-            "<b>✅ پایگاه‌داده با موفقیت بازیابی شد!</b> ربات آماده به کار است.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await message.reply(f"❌ خطا در بازیابی دیتابیس: {e}")
-
-
-# --- راهنمای دستورات ---
-
-@user_router.message(Command("help"))
-@user_router.message(F.text == "راهنمای جامع بانک")
-async def cmd_help(message: Message):
-    user_id = message.from_user.id
-    is_sa = is_super_admin(user_id)
-    u = await get_user_data(user_id)
-    is_adm = u and u["is_admin"]
-
-    txt = (
-        "📱 <b>راهنمای دستورات کاربران:</b>\n"
-        "🔹 <code>/start</code> - شروع و دریافت شماره حساب\n"
-        "🔹 <code>/profile</code> یا «پروفایل» - مشاهده نام، شماره حساب، موجودی و وضعیت\n"
-        "🔹 <code>/transfer</code> یا «انتقال آتر» - انتقال آتر (چند روش مختلف)\n"
-        "🔹 <code>/my_orders</code> یا «خریدهای من» - مشاهده لیست اجناس خریده‌شده\n"
-        "🔹 <code>/shops</code> - مشاهده لیست فروشگاه‌های فعال\n\n"
-        "🛍️ <b>دستورات فروشندگان:</b>\n"
-        "🔹 <code>/register_shop (نام فروشگاه) (شناسه)</code> - ثبت فروشگاه جدید\n"
-        "🔹 <code>/add_product</code> - اضافه کردن محصول جدید\n"
-        "🔹 <code>/post_product [product_id]</code> - دریافت پست و لینک خرید مستقیم\n\n"
-    )
-
-    if is_adm or is_sa:
-        txt += (
-            "👥 <b>دستورات ادمین (فقط پیوی):</b>\n"
-            "🔹 <code>/users</code> - لیست کاربران\n"
-            "🔹 <code>/groups</code> - لیست گروه‌ها\n"
-            "🔹 <code>/group_users [نام]</code> - اعضای یک گروه\n"
-            "🔹 <code>/create_group [نام]</code> - فقط اضافه کردن گروه (بدون لینک)\n"
-            "🔹 <code>/add_group [نام]</code> - ساخت <b>گروه مجازی</b> + لینک دعوت یکتا\n"
-            "🔹 <code>/extend_group [نام] [روز]</code> - تمدید لینک فعلی\n"
-            "🔹 <code>/renew_group [نام] [روز]</code> - ساخت لینک جدید با مدت اعتبار\n"
-            "🔹 <code>/rename_group [قدیمی] [جدید]</code> - تغییر نام گروه\n"
-            "🔹 <code>/move_group [آیدی] [گروه]</code> - تغییر گروه کاربر\n"
-            "🔹 <code>/remove_group [آیدی]</code> - برگرداندن به Default\n\n"
-        )
-
-    if is_sa:
-        txt += (
-            "👑 <b>دستورات سوپرادمین (مدیریت بانک، پستچی و شاپ):</b>\n"
-            "🔸 <code>/treasury</code> - مشاهده موجودی خزانه مرکزی\n"
-            "🔸 <code>/withdraw_treasury [مبلغ]</code> - برداشت از خزانه بانک\n"
-            "🔸 <code>/set_shop_rates [فروشنده] [خزانه] [مالیات]</code> - تنظیم درصد‌های شاپ\n"
-            "🔸 <code>/set_courier_rates [پستچی] [خزانه] [مالیات]</code> - تنظیم درصد‌های پستچی\n"
-            "🔸 <code>/add_courier [آیدی]</code> - افزودن پستچی جدید\n"
-            "🔸 <code>/remove_courier [آیدی]</code> - حذف پستچی\n"
-            "🔸 <code>/delete_shop [shop_id]</code> - حذف فروشگاه\n"
-            "🔸 <code>/give [آیدی] [مقدار]</code> - واریز مدیریتی\n"
-            "🔸 <code>/take [آیدی] [مقدار]</code> - کسر مدیریتی\n"
-            "🔸 <code>/rewardgroup [گروه] [مقدار]</code> - پاداش گروهی\n"
-            "🔸 <code>/undo [شناسه]</code> - برگشت تراکنش\n"
-            "🔸 <code>/economy</code> - آمار اقتصاد\n"
-            "🔸 <code>/check [آیدی]</code> - اطلاعات کامل کاربر\n"
-            "🔸 <code>/promote [آیدی]</code> - ارتقا به ادمین\n"
-            "🔸 <code>/demote [آیدی]</code> - عزل ادمین\n"
-            "🔸 <code>/list_admins</code> - مشاهده لیست ادمین‌ها\n"
-            "🔸 <code>/add_super [آیدی]</code> - اضافه کردن سوپرادمین\n"
-            "🔸 <code>/remove_super [آیدی]</code> - حذف سوپرادمین\n"
-            "🔸 <code>/delete_group [نام]</code> - حذف کامل گروه\n"
-            "🔸 <code>/freeze [آیدی]</code> - فریز حساب\n"
-            "🔸 <code>/unfreeze [آیدی]</code> - رفع فریز\n"
-            "🔸 <code>/backup_now</code> - بکاپ ZIP\n"
-            "🔸 <code>/force_backup</code> - ارسال بکاپ به کانال\n"
-            "🔸 <code>/restore</code> - بازیابی دیتابیس\n"
-        )
-
-    await message.reply(txt, parse_mode="HTML")
-
-
-async def main():
-    bot = Bot(token=BOT_TOKEN)
-
-    await start_dummy_server()
-    await restore_db_from_telegram(bot)
-    await init_db()
-
-    asyncio.create_task(auto_backup_loop(bot))
-
-    dp = Dispatcher(storage=MemoryStorage())
-
-    dp.include_router(admin_router)
-    dp.include_router(shop_router)
-    dp.include_router(user_router)
-
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
