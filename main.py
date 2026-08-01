@@ -3474,7 +3474,7 @@ async def _create_loan_installments(db, loan_id: int, total_repayment: int, coun
     remainder = total_repayment - (base_each * count)
     for i in range(1, count + 1):
         amt = base_each + (remainder if i == count else 0)
-        due_date = created_at + timedelta(days=10 * i)
+        due_date = created_at + timedelta(hours=2 * i)
         await db.execute(
             """
             INSERT INTO loan_installments
