@@ -2,15 +2,18 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 import html
 import logging
+import math
 import os
 import random
+import re
 import shutil
+import sqlite3
 import string
 import uuid
 import zipfile
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -38,7 +41,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "atr_bank.db"
 BACKUP_DIR = "backups"
 MAX_BALANCE_LIMIT = 1000000000  # سقف ۱ میلیارد آتر
-USERS_PER_PAGE = 5  # تعداد کاربران در هر صفحه پنل مدیریت
+USERS_PER_PAGE = 10  # تعداد کاربران در هر صفحه پنل مدیریت
 
 # ⚙️ آیدی عددی کانال خصوصی بکاپ تلگرام شما
 BACKUP_CHANNEL_ID = -1003971216432
@@ -84,9 +87,20 @@ class TxForm(StatesGroup):
 
 class AdminConfirmForm(StatesGroup):
     waiting_for_confirm = State()
+    waiting_for_frozen_ack = State()
 
 
 class ResetForm(StatesGroup):
+    waiting_for_confirm = State()
+
+
+class TreasuryConfirmForm(StatesGroup):
+    waiting_for_confirm = State()
+    waiting_for_frozen_ack = State()
+
+
+class OpsConfirmForm(StatesGroup):
+    """تأییدیه دو مرحله‌ای (پیش‌نمایش + تأیید/لغو) برای دستورات فروشگاه و مدیریت گروه‌ها."""
     waiting_for_confirm = State()
 
 
@@ -99,6 +113,11 @@ class AddProductForm(StatesGroup):
     waiting_for_stock_type = State()
     waiting_for_stock = State()
     waiting_for_needs_courier = State()
+
+
+class ProductEditForm(StatesGroup):
+    waiting_for_new_price = State()
+    waiting_for_new_stock = State()
 
 
 class RequestShopForm(StatesGroup):
@@ -116,6 +135,146 @@ class LoanForm(StatesGroup):
     waiting_for_installments = State()
     waiting_for_method = State()
     waiting_for_guarantor = State()
+    waiting_for_guarantor_confirm = State()
+
+
+# =====================================================================================
+# ⏳ سیستم لغو خودکار عملیات‌های نیمه‌کاره (Input Timeout Auto-Cancel)
+# =====================================================================================
+# اگر کاربر وارد یک فرآیندی شد که نیاز به دریافت ورودی (پیام یا انتخاب دکمه) دارد، اما
+# ظرف ۱ دقیقه ادامه نداد: عملیات به‌صورت خودکار لغو، State مربوطه به‌طور کامل پاک و هیچ
+# اطلاعات ناقصی ذخیره نمی‌شود؛ کاربر می‌تواند بدون هیچ محدودیتی فرآیند را از نو آغاز کند.
+INPUT_TIMEOUT_SECONDS = 60
+_pending_input_timeouts: dict[tuple[int, int], asyncio.Task] = {}
+
+
+def _timeout_key(chat_id: int, user_id: int) -> tuple[int, int]:
+    return (chat_id, user_id)
+
+
+def cancel_input_timeout(chat_id: int, user_id: int) -> None:
+    """لغو تایمر عدم‌فعالیت در صورتی که کاربر ورودی معتبر ارسال کرده یا فرآیند پایان یافته باشد."""
+    task = _pending_input_timeouts.pop(_timeout_key(chat_id, user_id), None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _run_input_timeout(state: FSMContext, chat_id: int, user_id: int, expected_state, on_timeout) -> None:
+    try:
+        await asyncio.sleep(INPUT_TIMEOUT_SECONDS)
+        current_state = await state.get_state()
+        if current_state != expected_state:
+            return  # کاربر قبلاً ادامه داده یا فرآیند به‌طریق دیگری پایان یافته است
+        await state.clear()
+        try:
+            await on_timeout()
+        except Exception as e:
+            logging.error(f"❌ خطا در لغو خودکار عملیات نیمه‌کاره: {e}")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _pending_input_timeouts.pop(_timeout_key(chat_id, user_id), None)
+
+
+def schedule_input_timeout(state: FSMContext, chat_id: int, user_id: int, expected_state, on_timeout) -> None:
+    """
+    فعال‌سازی تایمر لغو خودکار برای یک State در حال انتظار ورودی.
+    expected_state: خروجی state.get_state() بلافاصله پس از set_state (رشته نام State).
+    on_timeout: تابع async بدون آرگومان که هنگام وقوع Timeout اجرا می‌شود (ادیت/ارسال پیام اطلاع‌رسانی).
+    """
+    cancel_input_timeout(chat_id, user_id)
+    task = asyncio.create_task(_run_input_timeout(state, chat_id, user_id, expected_state, on_timeout))
+    _pending_input_timeouts[_timeout_key(chat_id, user_id)] = task
+
+
+async def _default_timeout_notice(bot: Bot, chat_id: int, message_id) -> None:
+    """پیام پیش‌فرض اطلاع‌رسانی لغو خودکار برای فرآیندهایی که پیام اصلی ثابتی برای Edit ندارند."""
+    text = (
+        "⏳ <b>عملیات لغو شد</b>\n\n"
+        "به دلیل عدم دریافت پاسخ در بازه ۱ دقیقه، این عملیات به‌صورت خودکار لغو شد.\n"
+        "می‌توانید فرآیند را مجدداً از ابتدا آغاز کنید."
+    )
+    if message_id:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    try:
+        await bot.send_message(chat_id, text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+# =====================================================================================
+# ⚠️ ابزارهای مشترک هشدار «مقصد فریز است» برای دستورات مالی تک‌نفره و گروهی
+# (بدون رد کردن عملیات؛ صرفاً یک مرحله هشدار/تأیید اضافه اضافه می‌شود)
+# =====================================================================================
+FROZEN_WARN_PAGE_SIZE = 10
+
+
+def _frozen_target_card_text(u, user_id: int) -> str:
+    """کارت اطلاعاتی هشدار برای یک مقصد فریزشده (نام، یوزرنیم، آیدی، گروه)."""
+    safe_name = html.escape(u["full_name"] or "ناشناس")
+    safe_username = f"@{html.escape(u['username'])}" if u["username"] else "—"
+    safe_group = html.escape(u["group_name"] or "Default")
+    return (
+        "⚠️ <b>هشدار: حساب مقصد فریز (Freeze) است!</b>\n\n"
+        f"👤 نام: <b>{safe_name}</b>\n"
+        f"🔗 یوزرنیم: {safe_username}\n"
+        f"🆔 آیدی: <code>{user_id}</code>\n"
+        f"🏷 گروه: {safe_group}\n\n"
+        "آیا با وجود فریز بودن حساب مقصد، مایل به ادامه عملیات هستید؟"
+    )
+
+
+def _group_frozen_warning_page(normal_count: int, frozen_members, page: int, g_name: str, per_amount: int):
+    """
+    متن و کیبورد صفحه هشدار فریز عملیات گروهی را می‌سازد: آمار کامل (تعداد فعال/فریز،
+    گروه، مبلغ فردی، مجموع هر دو حالت) + لیست صفحه‌بندی‌شده اعضای فریز (حداکثر ۱۰ نفر
+    در هر صفحه) + دو دکمه انتخاب مسیر اجرا (شامل کردن یا رد کردن فریزها).
+    """
+    frozen_count = len(frozen_members)
+    total_pages = max(1, math.ceil(frozen_count / FROZEN_WARN_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * FROZEN_WARN_PAGE_SIZE
+    page_items = frozen_members[start:start + FROZEN_WARN_PAGE_SIZE]
+
+    safe_g_name = html.escape(g_name)
+    total_all = (normal_count + frozen_count) * per_amount
+    total_normal_only = normal_count * per_amount
+
+    text = (
+        f"⚠️ <b>هشدار: در گروه «{safe_g_name}» کاربر فریز وجود دارد</b>\n\n"
+        f"👤 تعداد اعضای فعال (بدون فریز): <code>{normal_count}</code>\n"
+        f"❄️ تعداد اعضای فریز: <code>{frozen_count}</code>\n"
+        f"👥 گروه/دسته‌بندی: <b>{safe_g_name}</b>\n"
+        f"💰 مبلغ فردی: <code>₳ {per_amount}</code>\n"
+        f"🧮 مجموع (در صورت شامل کردن فریزها): <code>₳ {total_all}</code>\n"
+        f"🧮 مجموع (در صورت رد کردن فریزها): <code>₳ {total_normal_only}</code>\n\n"
+        f"❄️ <b>لیست کاربران فریز:</b>\n"
+    )
+    for m in page_items:
+        safe_name = html.escape(m["full_name"] or "ناشناس")
+        safe_username = f"@{html.escape(m['username'])}" if m["username"] else "—"
+        text += f"👤 <b>{safe_name}</b> | {safe_username} | <code>{m['user_id']}</code>\n"
+    if total_pages > 1:
+        text += f"\n📄 صفحه {page + 1} از {total_pages}"
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ صفحه قبل", callback_data=f"gfwarn_page_{page - 1}"))
+    if total_pages > 1:
+        nav_row.append(InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="gfwarn_noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="صفحه بعد ➡️", callback_data=f"gfwarn_page_{page + 1}"))
+
+    rows = []
+    if nav_row:
+        rows.append(nav_row)
+    rows.append([InlineKeyboardButton(text="💰 انتقال پول به کاربران فریز‌شده", callback_data="gfwarn_include")])
+    rows.append([InlineKeyboardButton(text="🚫 رد کردن کاربران فریز‌شده", callback_data="gfwarn_exclude")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 class AntiSpamMiddleware(BaseMiddleware):
@@ -214,6 +373,19 @@ async def init_db():
                 channel_msg_id INTEGER
             )
         """)
+
+        # --- 🏷 مهاجرت (Migration) سیستم کدگذاری یکتای محصولات ---
+        # (بدون حذف یا تغییر هیچ‌کدام از ستون‌ها یا داده‌های قبلی محصولات)
+        try:
+            await db.execute("ALTER TABLE products ADD COLUMN product_code TEXT")
+        except Exception:
+            pass  # ستون از قبل وجود دارد
+        try:
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_product_code ON products(product_code)"
+            )
+        except Exception:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS couriers (
                 user_id INTEGER PRIMARY KEY
@@ -249,6 +421,12 @@ async def init_db():
             )
         """)
 
+        # --- 📦 مهاجرت (Migration) ستون تاریخ ثبت سفارش، برای نمایش «تاریخ دریافت» در /my_assets ---
+        try:
+            await db.execute("ALTER TABLE orders ADD COLUMN created_at TEXT")
+        except Exception:
+            pass  # ستون از قبل وجود دارد
+
         # --- 🏛 جداول جدید سیستم مالی: بانک آترامنتوم و وام پویا ---
         await db.execute("""
             CREATE TABLE IF NOT EXISTS loans (
@@ -259,7 +437,7 @@ async def init_db():
                 interest_rate REAL,
                 total_repayment INTEGER,
                 installments_count INTEGER,
-                status TEXT,          -- PENDING_GUARANTOR, PENDING_ADMIN, ACTIVE, REJECTED, PAID, FAILED
+                status TEXT,          -- PENDING_GUARANTOR, PENDING_GUARANTOR_FINAL, PENDING_ADMIN, ACTIVE, REJECTED, CANCELLED, PAID, FAILED
                 loan_type TEXT,       -- COLLATERAL, GUARANTOR
                 created_at TIMESTAMP
             )
@@ -283,6 +461,31 @@ async def init_db():
         ]:
             try:
                 await db.execute(f"ALTER TABLE loan_installments ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass  # ستون از قبل وجود دارد
+
+        # --- 🔒 مهاجرت (Migration) ستون مبلغ وثیقه ثابت‌شده وام ---
+        # طبق سیستم جدید وثیقه، هیچ مبلغی در لحظه ثبت درخواست قفل نمی‌شود؛ مبلغ وثیقه فقط
+        # محاسبه و روی خود وام ذخیره می‌شود تا اگر سوپرادمین بعداً نرخ وثیقه را تغییر دهد،
+        # وام‌های در حال بررسی/فعال قبلی هنگام تأیید یا آزادسازی دچار مغایرت نشوند.
+        for col_name, col_type in [
+            ("collateral_amount", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE loans ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass  # ستون از قبل وجود دارد
+
+        # --- 🤝 مهاجرت (Migration) ستون‌های وثیقه وام ضامنی (گیرنده و ضامن) ---
+        # طبق سیستم جدید وام ضامنی، وثیقه هر دو طرف (گیرنده و ضامن) در لحظه ثبت درخواست
+        # محاسبه و روی خود وام ذخیره می‌شود، اما قفل واقعی (frozen_balance) فقط در لحظه
+        # تأیید نهایی سوپرادمین انجام می‌گیرد؛ دقیقاً مطابق همان منطق وام وثیقه‌ای.
+        for col_name, col_type in [
+            ("borrower_collateral_amount", "INTEGER DEFAULT 0"),
+            ("guarantor_collateral_amount", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE loans ADD COLUMN {col_name} {col_type}")
             except Exception:
                 pass  # ستون از قبل وجود دارد
 
@@ -322,6 +525,10 @@ async def init_db():
             ("collateral_rate", 0.17),
             ("required_balance_rate", 0.40),
             ("late_penalty_rate", 0.0085),
+            ("loan_guarantor_balance_rate_borrower", 0.20),
+            ("loan_guarantor_balance_rate_guarantor", 0.20),
+            ("loan_guarantor_collateral_rate_borrower", 0.08),
+            ("loan_guarantor_collateral_rate_guarantor", 0.09),
         ]
         for key, val in default_settings:
             await db.execute("INSERT OR IGNORE INTO system_settings (key, val) VALUES (?, ?)", (key, val))
@@ -501,6 +708,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
         return await message.reply("ℹ️ در حال حاضر هیچ عملیات درحال‌انجامی برای لغو کردن وجود ندارد.")
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     await state.clear()
     await message.reply("✅ عملیات جاری با موفقیت لغو شد. می‌توانید از ابتدا شروع کنید.")
 
@@ -612,6 +820,56 @@ async def get_users_page(page: int):
 
     if page < total_pages:
         nav_row.append(InlineKeyboardButton(text="بعدی ⬅️", callback_data=f"users_page_{page + 1}"))
+
+    if nav_row:
+        buttons.append(nav_row)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    return text, kb
+
+
+# --- ساخت صفحه کاربران فریزشده (مطابق دقیق ساختار /users؛ فقط فیلتر is_frozen و فیلدهای نمایشی متفاوت) ---
+async def get_frozen_users_page(page: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT COUNT(*) as total FROM users WHERE is_frozen = 1") as cur:
+            total_users = (await cur.fetchone())["total"]
+
+        total_pages = max(1, (total_users + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+        page = max(1, min(page, total_pages))
+        offset = (page - 1) * USERS_PER_PAGE
+
+        async with db.execute(
+            "SELECT user_id, username, full_name, group_name FROM users WHERE is_frozen = 1 LIMIT ? OFFSET ?",
+            (USERS_PER_PAGE, offset),
+        ) as cur:
+            users = await cur.fetchall()
+
+    text = f"🥶 <b>لیست کاربران فریزشده (صفحه {page} از {total_pages})</b>\n"
+    text += f"📊 کل کاربران فریزشده: <code>{total_users}</code> نفر\n\n"
+
+    for idx, u in enumerate(users, start=offset + 1):
+        safe_full_name = html.escape(u['full_name'] or 'ناشناس')
+        safe_group_name = html.escape(u['group_name'] or 'Default')
+        safe_username = f"@{html.escape(u['username'])}" if u['username'] else "ندارد"
+        text += (
+            f"<b>{idx}. {safe_full_name}</b>\n"
+            f"آیدی عددی: <code>{u['user_id']}</code>\n"
+            f"یوزرنیم: {safe_username}\n"
+            f"گروه: <b>{safe_group_name}</b>\n"
+            f"------------------------------\n"
+        )
+
+    buttons = []
+    nav_row = []
+
+    if page > 1:
+        nav_row.append(InlineKeyboardButton(text="➡️ قبلی", callback_data=f"frozen_users_page_{page - 1}"))
+
+    nav_row.append(InlineKeyboardButton(text=f"📄 {page}/{total_pages}", callback_data="frozen_users_noop"))
+
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton(text="بعدی ⬅️", callback_data=f"frozen_users_page_{page + 1}"))
 
     if nav_row:
         buttons.append(nav_row)
@@ -771,7 +1029,8 @@ async def process_transfer_request(message: Message, state: FSMContext, to_user_
 
     if not u or u["is_frozen"]:
         return await message.reply("❌ حساب شما مسدود (فریز) است.")
-    if amount <= 0 or amount > MAX_BALANCE_LIMIT or to_user_id == from_user or u["balance"] < amount:
+    transferable = max(0, u["balance"] - u["frozen_balance"])
+    if amount <= 0 or amount > MAX_BALANCE_LIMIT or to_user_id == from_user or transferable < amount:
         return await message.reply("❌ پارامترهای تراکنش یا موجودی نامعتبر است.")
 
     target = await get_user_data(to_user_id)
@@ -792,7 +1051,7 @@ async def process_transfer_request(message: Message, state: FSMContext, to_user_
             InlineKeyboardButton(text="❌ انصراف", callback_data="tx_no"),
         ]]
     )
-    await message.reply(
+    confirm_msg = await message.reply(
         f"⚠️ تأییدیه انتقال آتر\n"
         f"دریافت‌کننده: {safe_target_name} (<code>{to_user_id}</code>)\n"
         f"مبلغ: <code>₳ {amount}</code>\n"
@@ -801,6 +1060,11 @@ async def process_transfer_request(message: Message, state: FSMContext, to_user_
         parse_mode="HTML",
     )
     await state.set_state(TxForm.waiting_for_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, from_user, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
+    )
 
 
 @user_router.message(Command("transfer"))
@@ -896,6 +1160,7 @@ async def confirm_transfer_cb(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != from_user:
         return await callback.answer("❌ فقط انتقال‌دهنده می‌تواند تأیید کند.", show_alert=True)
 
+    cancel_input_timeout(callback.message.chat.id, from_user)
     await state.clear()
     to_user_id = data["to_user_id"]
     amount = data["amount"]
@@ -906,7 +1171,7 @@ async def confirm_transfer_cb(callback: CallbackQuery, state: FSMContext):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT balance, is_frozen FROM users WHERE user_id = ?",
+                "SELECT balance, frozen_balance, is_frozen FROM users WHERE user_id = ?",
                 (from_user,),
             ) as cur:
                 s = await cur.fetchone()
@@ -915,10 +1180,11 @@ async def confirm_transfer_cb(callback: CallbackQuery, state: FSMContext):
             ) as cur2:
                 r = await cur2.fetchone()
 
+            s_transferable = max(0, s["balance"] - s["frozen_balance"]) if s else 0
             if (
                 not s
                 or s["is_frozen"]
-                or s["balance"] < amount
+                or s_transferable < amount
                 or not r
                 or (r["balance"] + amount > MAX_BALANCE_LIMIT)
             ):
@@ -993,6 +1259,7 @@ async def cancel_transfer_cb(callback: CallbackQuery, state: FSMContext):
     from_user = data.get("from_user") or callback.from_user.id
     if callback.from_user.id != from_user:
         return await callback.answer("❌ فقط انتقال‌دهنده می‌تواند لغو کند.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, from_user)
     await state.clear()
     await callback.message.edit_text("❌ انتقال وجه لغو شد.")
 
@@ -1005,45 +1272,13 @@ async def cmd_users(message: Message):
     if not is_private(message) or not await check_admin_filter(message):
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT user_id, full_name, balance, group_name FROM users ORDER BY user_id"
-        ) as cur:
-            users = await cur.fetchall()
-
-    if not users:
-        return await message.reply("هیچ کاربری یافت نشد.")
-
-    header = f"👥 <b>لیست تمام کاربران</b> (<code>{len(users)}</code> نفر)\n\n"
-    
-    parts = []
-    current = header
-    for idx, u in enumerate(users, start=1):
-        safe_full_name = html.escape(u['full_name'] or 'ناشناس')
-        safe_group_name = html.escape(u['group_name'] or 'Default')
-        chunk = (
-            f"<b>{idx}. {safe_full_name}</b>\n"
-            f"شماره حساب: <code>{u['user_id']}</code>\n"
-            f"موجودی: <code>₳ {u['balance']}</code>\n"
-            f"گروه: <b>{safe_group_name}</b>\n"
-            f"------------------------------\n"
-        )
-        if len(current) + len(chunk) > 4000:
-            parts.append(current)
-            current = chunk
-        else:
-            current += chunk
-    if current:
-        parts.append(current)
-        
-    for part in parts:
-        await message.reply(part, parse_mode="HTML")
+    text, kb = await get_users_page(1)
+    await message.reply(text, reply_markup=kb, parse_mode="HTML")
 
 
 @admin_router.callback_query(F.data.startswith("users_page_"))
 async def cb_users_page(callback: CallbackQuery):
-    if not await check_admin_filter(callback.message):
+    if not await check_admin_filter(callback):
         return await callback.answer("عدم دسترسی.", show_alert=True)
 
     page = int(callback.data.split("_")[2])
@@ -1061,8 +1296,424 @@ async def cb_users_noop(callback: CallbackQuery):
     await callback.answer()
 
 
+@admin_router.message(Command("frozen_users"))
+async def cmd_frozen_users(message: Message):
+    if not is_private(message) or not await check_admin_filter(message):
+        return
+
+    text, kb = await get_frozen_users_page(1)
+    await message.reply(text, reply_markup=kb, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data.startswith("frozen_users_page_"))
+async def cb_frozen_users_page(callback: CallbackQuery):
+    if not await check_admin_filter(callback):
+        return await callback.answer("عدم دسترسی.", show_alert=True)
+
+    page = int(callback.data.split("_")[3])
+    text, kb = await get_frozen_users_page(page)
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "frozen_users_noop")
+async def cb_frozen_users_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+# =====================================================================================
+# 🛡 سیستم تأییدیه دو مرحله‌ای عمومی (پیش‌نمایش + تأیید/لغو) برای دستورات فروشگاه
+# و مدیریت گروه‌ها: /delete، /create_group، /add_group، /extend_group، /renew_group،
+# /rename_group، /move_group، /remove_group.
+# هیچ‌کدام از این دستورات با ارسال مستقیم توسط کاربر اجرا نمی‌شوند؛ ابتدا یک کارت
+# پیش‌نمایش با دو دکمه شیشه‌ای نمایش داده می‌شود و فقط با کلیک روی «✅ تأیید و اجرای
+# نهایی» عملیات واقعی (تغییر دیتابیس) انجام می‌گیرد.
+# =====================================================================================
+
+def _build_ops_confirm_dialog(preview_text: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید و اجرای نهایی", callback_data="ops_confirm_yes"),
+        InlineKeyboardButton(text="❌ لغو عملیات", callback_data="ops_confirm_no"),
+    ]])
+
+
+async def _start_ops_confirmation(message: Message, state: FSMContext, op_action: str, preview_text: str, **extra) -> None:
+    """ذخیره پارامترهای عملیات در State و نمایش کارت پیش‌نمایش (بدون هیچ تغییری در دیتابیس)."""
+    await state.update_data(op_action=op_action, op_requester_id=message.from_user.id, **extra)
+    kb = _build_ops_confirm_dialog(preview_text)
+    confirm_msg = await message.reply(preview_text, reply_markup=kb, parse_mode="HTML")
+    await state.set_state(OpsConfirmForm.waiting_for_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
+    )
+
+
+async def _execute_ops_confirmed_action(callback: CallbackQuery, data: dict) -> None:
+    """اجرای واقعی عملیات (تغییر دیتابیس) پس از کلیک «✅ تأیید و اجرای نهایی»؛ منطق هر عملیات
+    دقیقاً همان منطق اصلی دستور مربوطه است، فقط خروجی به‌جای message.reply روی همان پیام
+    پیش‌نمایش ادیت می‌شود."""
+    action = data["op_action"]
+    bot = callback.bot
+
+    if action == "delete_product":
+        product_id = data["op_product_id"]
+        channel_id = data["op_channel_id"]
+        channel_msg_id = data["op_channel_msg_id"]
+        product_title = data["op_product_title"]
+
+        async with db_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT order_id, buyer_id, price, courier_fee FROM orders WHERE product_id = ? AND status = 'DISPATCHED'",
+                    (product_id,)
+                ) as cur_ord:
+                    active_orders = await cur_ord.fetchall()
+
+                for o in active_orders:
+                    total_frozen = o["price"] + o["courier_fee"]
+                    await db.execute(
+                        "UPDATE users SET balance = balance + ?, frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
+                        (total_frozen, total_frozen, o["buyer_id"])
+                    )
+                    await db.execute("UPDATE orders SET status = 'CANCELLED' WHERE order_id = ?", (o["order_id"],))
+
+                cancelled_orders = len(active_orders)
+
+                await db.execute("DELETE FROM products WHERE product_id = ?", (product_id,))
+                await db.commit()
+
+        try:
+            await bot.delete_message(chat_id=channel_id, message_id=channel_msg_id)
+        except Exception:
+            pass
+
+        for o in active_orders:
+            try:
+                await bot.send_message(
+                    o["buyer_id"],
+                    f"❌ محصول «<b>{html.escape(product_title)}</b>» توسط فروشنده حذف شد و سفارش شما لغو گردید.\n"
+                    f"🔓 مبلغ فریزشده این سفارش (<code>₳ {o['price'] + o['courier_fee']}</code>) به‌طور کامل به موجودی قابل‌استفاده شما بازگشت.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+        note = f"\n\n⚠️ توجه: <code>{cancelled_orders}</code> سفارش در حال ارسال مربوط به این محصول لغو شد و مبلغ فریزشده هرکدام به‌طور کامل به خریدار بازگشت (بدون هیچ تغییر مالی در حساب شما یا اشخاص دیگر)." if cancelled_orders else ""
+        await callback.message.edit_text(
+            f"🗑 محصول «<b>{html.escape(product_title)}</b>» با موفقیت از فروشگاه شما حذف شد.{note}",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "create_group":
+        g_name = data["op_group_name"]
+        safe_g_name = html.escape(g_name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT 1 FROM groups WHERE group_name = ?", (g_name,))
+            exists = await cursor.fetchone()
+            if exists:
+                return await callback.message.edit_text(f"ℹ️ گروه <b>{safe_g_name}</b> از قبل وجود دارد.", parse_mode="HTML")
+            await db.execute("INSERT INTO groups (group_name) VALUES (?)", (g_name,))
+            await db.commit()
+        await callback.message.edit_text(
+            f"✅ گروه <b>{safe_g_name}</b> با موفقیت به لیست گروه‌ها اضافه شد.\n(هیچ لینکی ساخته نشد)",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "add_group":
+        g_name = data["op_group_name"]
+        code = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+        async with db_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("INSERT OR IGNORE INTO groups (group_name) VALUES (?)", (g_name,))
+                await db.execute("INSERT INTO group_links (code, group_name) VALUES (?, ?)", (code, g_name))
+                await db.commit()
+        bot_info = await bot.get_me()
+        link = f"https://t.me/{bot_info.username}?start=G_{code}"
+        safe_g_name = html.escape(g_name)
+        await callback.message.edit_text(
+            f"✅ <b>گروه مجازی «{safe_g_name}»</b> با موفقیت در سیستم ربات ایجاد شد.\n\n"
+            f"🔗 <b>لینک عضویت اختصاصی:</b>\n{link}\n\n"
+            f"📌 توجه: این گروه صرفاً یک برچسب درون ربات است و ارتباطی با گروه‌های تلگرام ندارد.\n"
+            f"کاربران با کلیک روی لینک فوق، به این گروه در ربات ملحق میشوند.",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "extend_group":
+        g_name = data["op_group_name"]
+        extra_days = data["op_days"]
+        safe_g_name = html.escape(g_name)
+        async with db_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute(
+                    "SELECT code FROM group_links WHERE group_name = ? ORDER BY rowid DESC LIMIT 1",
+                    (g_name,),
+                )
+                row = await cursor.fetchone()
+                if not row:
+                    return await callback.message.edit_text(f"❌ گروهی با نام {safe_g_name} یا لینکی برای آن پیدا نشد.", parse_mode="HTML")
+
+                old_code = row[0]
+                try:
+                    await db.execute("ALTER TABLE group_links ADD COLUMN expires_at TEXT")
+                except Exception:
+                    pass
+
+                new_expires = (datetime.now(timezone.utc) + timedelta(days=extra_days)).isoformat()
+                await db.execute("UPDATE group_links SET expires_at = ? WHERE code = ?", (new_expires, old_code))
+                await db.commit()
+
+        bot_info = await bot.get_me()
+        link = f"https://t.me/{bot_info.username}?start=G_{old_code}"
+        await callback.message.edit_text(
+            f"✅ لینک گروه <b>{safe_g_name}</b> به مدت {extra_days} روز تمدید شد.\n\n🔗 لینک:\n{link}",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "renew_group":
+        g_name = data["op_group_name"]
+        days = data["op_days"]
+        safe_g_name = html.escape(g_name)
+        new_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+        async with db_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                cursor = await db.execute("SELECT 1 FROM groups WHERE group_name = ?", (g_name,))
+                if not await cursor.fetchone():
+                    return await callback.message.edit_text(f"❌ گروهی با نام {safe_g_name} پیدا نشد.", parse_mode="HTML")
+
+                try:
+                    await db.execute("ALTER TABLE group_links ADD COLUMN expires_at TEXT")
+                except Exception:
+                    pass
+                try:
+                    await db.execute("ALTER TABLE group_links ADD COLUMN created_at TEXT")
+                except Exception:
+                    pass
+
+                await db.execute(
+                    "INSERT INTO group_links (code, group_name, expires_at) VALUES (?, ?, ?)",
+                    (new_code, g_name, expires_at),
+                )
+                await db.commit()
+
+        bot_info = await bot.get_me()
+        link = f"https://t.me/{bot_info.username}?start=G_{new_code}"
+        await callback.message.edit_text(
+            f"✅ لینک جدید برای گروه <b>{safe_g_name}</b> ساخته شد.\nمدت اعتبار: {days} روز\n\n🔗 لینک جدید:\n{link}",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "rename_group":
+        old_n = data["op_old_name"]
+        new_n = data["op_new_name"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO groups (group_name) VALUES (?)", (new_n,))
+            await db.execute("UPDATE users SET group_name = ? WHERE group_name = ?", (new_n, old_n))
+            await db.execute("DELETE FROM groups WHERE group_name = ?", (old_n,))
+            await db.commit()
+        await callback.message.edit_text("🔄 تغییر نام با موفقیت اعمال شد.")
+        return
+
+    if action == "move_group":
+        t_id = data["op_user_id"]
+        g_name = data["op_group_name"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET group_name = ? WHERE user_id = ?", (g_name, t_id))
+            await db.commit()
+        await callback.message.edit_text("👑 کاربر به گروه جدید منتقل شد.")
+        return
+
+    if action == "remove_group":
+        t_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET group_name = 'Default' WHERE user_id = ?", (t_id,))
+            await db.commit()
+        await callback.message.edit_text("✅ کاربر به گروه پیش‌فرض برگردانده شد.")
+        return
+
+    if action == "remove_shop":
+        shop_id = data["op_shop_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM shops WHERE shop_id = ?", (shop_id,))
+            await db.execute("DELETE FROM products WHERE shop_id = ?", (shop_id,))
+            await db.commit()
+        await callback.message.edit_text(f"🗑 فروشگاه شماره {shop_id} و محصولات آن حذف شدند.")
+        return
+
+    if action == "add_courier":
+        courier_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO couriers (user_id) VALUES (?)", (courier_id,))
+            await db.commit()
+        await callback.message.edit_text(f"🚚 کاربر <code>{courier_id}</code> به لیست پستچی‌های مجاز اضافه شد.", parse_mode="HTML")
+        return
+
+    if action == "remove_courier":
+        courier_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM couriers WHERE user_id = ?", (courier_id,))
+            await db.commit()
+        await callback.message.edit_text(f"🔥 کاربر <code>{courier_id}</code> از لیست پستچی‌ها حذف شد.", parse_mode="HTML")
+        return
+
+    if action == "promote":
+        target_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (target_id,))
+            await db.commit()
+        await callback.message.edit_text("👑 کاربر به سطح ادمین ارتقا یافت.")
+        return
+
+    if action == "demote":
+        target_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_admin = 0 WHERE user_id = ?", (target_id,))
+            await db.commit()
+        await callback.message.edit_text("🔥 دسترسی ادمینی کاربر سلب شد.")
+        return
+
+    if action == "add_super":
+        new_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO super_admins (user_id) VALUES (?)", (new_id,))
+            await db.commit()
+            await load_super_admins(db)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (new_id,))
+            await db.commit()
+        await callback.message.edit_text(f"✅ کاربر <code>{new_id}</code> به سوپرادمین‌ها اضافه شد.", parse_mode="HTML")
+        return
+
+    if action == "remove_super":
+        rem_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM super_admins WHERE user_id = ?", (rem_id,))
+            await db.commit()
+            await load_super_admins(db)
+        await callback.message.edit_text(f"✅ کاربر <code>{rem_id}</code> از سوپرادمین‌ها حذف شد.", parse_mode="HTML")
+        return
+
+    if action == "freeze":
+        target_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_frozen = 1 WHERE user_id = ?", (target_id,))
+            await db.commit()
+        await callback.message.edit_text("❄️ حساب کاربر فریز شد.")
+        return
+
+    if action == "unfreeze":
+        target_id = data["op_user_id"]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_frozen = 0 WHERE user_id = ?", (target_id,))
+            await db.commit()
+        await callback.message.edit_text("🟢 حساب کاربر فعال شد.")
+        return
+
+    if action == "undo_tx":
+        tx_id = data["op_tx_id"]
+        reason = data["op_reason"]
+
+        async with db_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("BEGIN IMMEDIATE")
+
+                async with db.execute(
+                    "SELECT from_user, to_user, amount, status FROM audit_logs WHERE tx_id = ?", (tx_id,)
+                ) as cur:
+                    tx = await cur.fetchone()
+
+                if not tx:
+                    await db.execute("ROLLBACK")
+                    return await callback.message.edit_text("❌ تراکنشی با این شناسه یافت نشد.")
+                if tx["status"] == "REFUNDED":
+                    await db.execute("ROLLBACK")
+                    return await callback.message.edit_text("❌ این تراکنش قبلاً باطل شده است.")
+
+                f_user, t_user, amount = tx["from_user"], tx["to_user"], tx["amount"]
+
+                if t_user != 0:
+                    async with db.execute("SELECT balance FROM users WHERE user_id = ?", (t_user,)) as cur_t:
+                        target = await cur_t.fetchone()
+                    if not target or target["balance"] < amount:
+                        await db.execute("ROLLBACK")
+                        return await callback.message.edit_text("❌ خطا: موجودی گیرنده برای برگشت زدن کافی نیست.")
+
+                    await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, t_user))
+
+                if f_user != 0:
+                    await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, f_user))
+
+                new_tx_id = f"TX-REV-{str(uuid.uuid4()).upper()[:10]}"
+                await db.execute("UPDATE audit_logs SET status = 'REFUNDED' WHERE tx_id = ?", (tx_id,))
+                await db.execute(
+                    """
+                    INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason, status)
+                    VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS')
+                """,
+                    (
+                        new_tx_id,
+                        datetime.now(timezone.utc).isoformat(),
+                        t_user,
+                        f_user,
+                        amount,
+                        f"برگشت تراکنش {tx_id}: {reason}",
+                    ),
+                )
+
+                await db.commit()
+
+        await callback.message.edit_text(
+            f"🔄 تراکنش با موفقیت معکوس شد.\n🔖 شناسه برگشتی: <code>{new_tx_id}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+
+@admin_router.callback_query(OpsConfirmForm.waiting_for_confirm, F.data == "ops_confirm_yes")
+async def cb_ops_confirm_yes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    requester_id = data.get("op_requester_id")
+    if callback.from_user.id != requester_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید تأیید کنید.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, requester_id)
+    await state.clear()
+    await callback.answer()
+    await _execute_ops_confirmed_action(callback, data)
+
+
+@admin_router.callback_query(OpsConfirmForm.waiting_for_confirm, F.data == "ops_confirm_no")
+async def cb_ops_confirm_no(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    requester_id = data.get("op_requester_id")
+    if callback.from_user.id != requester_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید لغو کنید.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, requester_id)
+    await state.clear()
+    try:
+        await callback.message.edit_text("❌ عملیات توسط کاربر لغو شد.")
+    except Exception:
+        pass
+    await callback.answer()
+
+
 @admin_router.message(Command("create_group"))
-async def cmd_create_group(message: Message):
+async def cmd_create_group(message: Message, state: FSMContext):
     """فقط گروه را به لیست اضافه می‌کند (بدون ساخت لینک)"""
     if not is_private(message) or not await check_admin_filter(message):
         return
@@ -1083,27 +1734,20 @@ async def cmd_create_group(message: Message):
     safe_g_name = html.escape(g_name)
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT 1 FROM groups WHERE group_name = ?", (g_name,)
-        )
+        cursor = await db.execute("SELECT 1 FROM groups WHERE group_name = ?", (g_name,))
         exists = await cursor.fetchone()
-        if exists:
-            return await message.reply(f"ℹ️ گروه <b>{safe_g_name}</b> از قبل وجود دارد.", parse_mode="HTML")
+    if exists:
+        return await message.reply(f"ℹ️ گروه <b>{safe_g_name}</b> از قبل وجود دارد.", parse_mode="HTML")
 
-        await db.execute(
-            "INSERT INTO groups (group_name) VALUES (?)", (g_name,)
-        )
-        await db.commit()
-
-    await message.reply(
-        f"✅ گروه <b>{safe_g_name}</b> با موفقیت به لیست گروه‌ها اضافه شد.\n"
-        f"(هیچ لینکی ساخته نشد)",
-        parse_mode="HTML",
+    preview_text = (
+        "🏢 <b>تأیید ساخت گروه</b>\n"
+        f"آیا از ایجاد گروه جدید با نام «{safe_g_name}» اطمینان دارید؟"
     )
+    await _start_ops_confirmation(message, state, "create_group", preview_text, op_group_name=g_name)
 
 
 @admin_router.message(Command("add_group"))
-async def cmd_add_group(message: Message):
+async def cmd_add_group(message: Message, state: FSMContext):
     if not is_private(message) or not await check_admin_filter(message):
         return
 
@@ -1121,37 +1765,16 @@ async def cmd_add_group(message: Message):
     if not g_name:
         return await message.reply("❌ نام گروه نمی‌تواند خالی باشد.")
 
-    code = "".join(
-        random.choices(string.ascii_uppercase + string.digits, k=10)
-    )
-
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT OR IGNORE INTO groups (group_name) VALUES (?)", (g_name,)
-            )
-            await db.execute(
-                "INSERT INTO group_links (code, group_name) VALUES (?, ?)",
-                (code, g_name),
-            )
-            await db.commit()
-
-    bot_info = await message.bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=G_{code}"
-
     safe_g_name = html.escape(g_name)
-
-    await message.reply(
-        f"✅ <b>گروه مجازی «{safe_g_name}»</b> با موفقیت در سیستم ربات ایجاد شد.\n\n"
-        f"🔗 <b>لینک عضویت اختصاصی:</b>\n{link}\n\n"
-        f"📌 توجه: این گروه صرفاً یک برچسب درون ربات است و ارتباطی با گروه‌های تلگرام ندارد.\n"
-        f"کاربران با کلیک روی لینک فوق، به این گروه در ربات ملحق میشوند.",
-        parse_mode="HTML"
+    preview_text = (
+        "🔗 <b>تأیید ساخت گروه و ساخت لینک</b>\n"
+        f"آیا می‌خواهید گروه مجازی «{safe_g_name}» ایجاد شده و لینک دعوت یکتا برای آن تولید شود؟"
     )
+    await _start_ops_confirmation(message, state, "add_group", preview_text, op_group_name=g_name)
 
 
 @admin_router.message(Command("extend_group"))
-async def cmd_extend_group(message: Message):
+async def cmd_extend_group(message: Message, state: FSMContext):
     if not is_private(message) or not await check_admin_filter(message):
         return
 
@@ -1171,42 +1794,23 @@ async def cmd_extend_group(message: Message):
     extra_days = int(days_str)
     safe_g_name = html.escape(g_name)
 
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT code FROM group_links WHERE group_name = ? ORDER BY rowid DESC LIMIT 1",
-                (g_name,),
-            )
-            row = await cursor.fetchone()
-            if not row:
-                return await message.reply(f"❌ گروهی با نام {safe_g_name} یا لینکی برای آن پیدا نشد.", parse_mode="HTML")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT code FROM group_links WHERE group_name = ? ORDER BY rowid DESC LIMIT 1", (g_name,)
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return await message.reply(f"❌ گروهی با نام {safe_g_name} یا لینکی برای آن پیدا نشد.", parse_mode="HTML")
 
-            old_code = row[0]
-
-            try:
-                await db.execute("ALTER TABLE group_links ADD COLUMN expires_at TEXT")
-            except Exception:
-                pass
-
-            new_expires = (datetime.now(timezone.utc) + timedelta(days=extra_days)).isoformat()
-            await db.execute(
-                "UPDATE group_links SET expires_at = ? WHERE code = ?",
-                (new_expires, old_code),
-            )
-            await db.commit()
-
-    bot_info = await message.bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=G_{old_code}"
-
-    await message.reply(
-        f"✅ لینک گروه <b>{safe_g_name}</b> به مدت {extra_days} روز تمدید شد.\n\n"
-        f"🔗 لینک:\n{link}",
-        parse_mode="HTML",
+    preview_text = (
+        "⏳ <b>تأیید تمدید لینک</b>\n"
+        f"آیا از افزودن {extra_days} روز به مهلت اعتبار لینک گروه «{safe_g_name}» اطمینان دارید؟"
     )
+    await _start_ops_confirmation(message, state, "extend_group", preview_text, op_group_name=g_name, op_days=extra_days)
 
 
 @admin_router.message(Command("renew_group"))
-async def cmd_renew_group(message: Message):
+async def cmd_renew_group(message: Message, state: FSMContext):
     if not is_private(message) or not await check_admin_filter(message):
         return
 
@@ -1224,77 +1828,167 @@ async def cmd_renew_group(message: Message):
         return await message.reply("❌ تعداد روز باید عدد مثبت باشد.")
 
     days = int(days_str)
-    new_code = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
     safe_g_name = html.escape(g_name)
 
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT 1 FROM groups WHERE group_name = ?", (g_name,)
-            )
-            if not await cursor.fetchone():
-                return await message.reply(f"❌ گروهی با نام {safe_g_name} پیدا نشد.", parse_mode="HTML")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT 1 FROM groups WHERE group_name = ?", (g_name,))
+        row = await cursor.fetchone()
+    if not row:
+        return await message.reply(f"❌ گروهی با نام {safe_g_name} پیدا نشد.", parse_mode="HTML")
 
-            try:
-                await db.execute("ALTER TABLE group_links ADD COLUMN expires_at TEXT")
-            except Exception:
-                pass
-            try:
-                await db.execute("ALTER TABLE group_links ADD COLUMN created_at TEXT")
-            except Exception:
-                pass
-
-            await db.execute(
-                "INSERT INTO group_links (code, group_name, expires_at) VALUES (?, ?, ?)",
-                (new_code, g_name, expires_at),
-            )
-            await db.commit()
-
-    bot_info = await message.bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start=G_{new_code}"
-
-    await message.reply(
-        f"✅ لینک جدید برای گروه <b>{safe_g_name}</b> ساخته شد.\n"
-        f"مدت اعتبار: {days} روز\n\n"
-        f"🔗 لینک جدید:\n{link}",
-        parse_mode="HTML",
+    preview_text = (
+        "🔄 <b>هشدار ابطال و بازسازی لینک</b>\n"
+        f"با این کار لینک فعلی گروه «{safe_g_name}» باطل شده و لینک جدیدی با اعتبار {days} روز ساخته می‌شود. آیا تأیید می‌کنید؟"
     )
+    await _start_ops_confirmation(message, state, "renew_group", preview_text, op_group_name=g_name, op_days=days)
 
 
 @admin_router.message(Command("rename_group"))
-async def cmd_rename_group(message: Message):
+async def cmd_rename_group(message: Message, state: FSMContext):
     if not is_private(message) or not await check_admin_filter(message):
         return
     args = message.text.split()
     if len(args) < 3:
         return await message.reply("استفاده: <code>/rename_group [قدیمی] [جدید]</code>", parse_mode="HTML")
     old_n, new_n = args[1], args[2]
+    safe_old_n = html.escape(old_n)
+    safe_new_n = html.escape(new_n)
+    preview_text = (
+        "✏️ <b>تأیید تغییر نام گروه</b>\n"
+        f"آیا از تغییر نام گروه از «{safe_old_n}» به «{safe_new_n}» اطمینان دارید؟ "
+        "(این تغییر برای تمام اعضای این گروه نیز اعمال می‌شود)"
+    )
+    await _start_ops_confirmation(message, state, "rename_group", preview_text, op_old_name=old_n, op_new_name=new_n)
+
+
+GROUPS_PAGE_SIZE = 10
+
+
+async def _fetch_groups_overview():
+    """برای هر گروه، تعداد اعضا و وضعیت آخرین لینک دعوت را محاسبه می‌کند."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO groups (group_name) VALUES (?)", (new_n,)
-        )
-        await db.execute(
-            "UPDATE users SET group_name = ? WHERE group_name = ?",
-            (new_n, old_n),
-        )
-        await db.execute("DELETE FROM groups WHERE group_name = ?", (old_n,))
-        await db.commit()
-    await message.reply("🔄 تغییر نام با موفقیت اعمال شد.")
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT group_name FROM groups ORDER BY group_name") as cur:
+            groups = await cur.fetchall()
+
+        result = []
+        for g in groups:
+            g_name = g["group_name"]
+            async with db.execute("SELECT COUNT(*) FROM users WHERE group_name = ?", (g_name,)) as cur_c:
+                member_count = (await cur_c.fetchone())[0]
+
+            try:
+                async with db.execute(
+                    "SELECT expires_at FROM group_links WHERE group_name = ? ORDER BY rowid DESC LIMIT 1", (g_name,)
+                ) as cur_l:
+                    link_row = await cur_l.fetchone()
+            except Exception:
+                link_row = None
+
+            if not link_row:
+                link_status = "⚪️ بدون لینک"
+            else:
+                expires_val = link_row[0]
+                if not expires_val:
+                    link_status = "🟢 فعال (بدون انقضا)"
+                else:
+                    try:
+                        expires = datetime.fromisoformat(str(expires_val))
+                        link_status = "🟢 فعال" if datetime.now(timezone.utc) <= expires else "🔴 منقضی‌شده"
+                    except Exception:
+                        link_status = "🟢 فعال"
+
+            result.append({"name": g_name, "member_count": member_count, "link_status": link_status})
+        return result
+
+
+def _render_groups_page(groups_info, page: int):
+    total = len(groups_info)
+    total_pages = max(1, math.ceil(total / GROUPS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * GROUPS_PAGE_SIZE
+    page_items = groups_info[start:start + GROUPS_PAGE_SIZE]
+
+    txt = f"🏢 <b>لیست گروه‌های مجازی ثبت‌شده (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"مجموع گروه‌ها: <code>{total}</code> گروه\n\n"
+    for g in page_items:
+        safe_name = html.escape(g["name"])
+        txt += f"🔹 <b>{safe_name}</b> | اعضا: <code>{g['member_count']}</code> نفر | لینک: {g['link_status']}\n"
+
+    kb = _build_pagination_keyboard(page, total_pages, "groups_page", refresh_data="groups_refresh")
+    return txt, kb
 
 
 @admin_router.message(Command("groups"))
 async def cmd_groups(message: Message):
     if not is_private(message) or not await check_admin_filter(message):
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT group_name FROM groups") as cur:
-            rows = await cur.fetchall()
-    txt = "👥 <b>لیست گروه‌ها:</b>\n"
-    for r in rows:
-        safe_name = html.escape(r[0])
-        txt += f"- <code>{safe_name}</code>\n"
-    await message.reply(txt, parse_mode="HTML")
+    groups_info = await _fetch_groups_overview()
+    if not groups_info:
+        return await message.reply("ℹ️ هیچ گروهی ثبت نشده است.")
+    txt, kb = _render_groups_page(groups_info, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data == "groups_page_noop")
+async def cb_groups_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("groups_page_"))
+async def cb_groups_page(callback: CallbackQuery):
+    if not await check_admin_filter(callback):
+        return await callback.answer("عدم دسترسی.", show_alert=True)
+    page = int(callback.data.split("_")[2])
+    groups_info = await _fetch_groups_overview()
+    if not groups_info:
+        return await callback.answer("ℹ️ هیچ گروهی ثبت نشده است.", show_alert=True)
+    txt, kb = _render_groups_page(groups_info, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "groups_refresh")
+async def cb_groups_refresh(callback: CallbackQuery):
+    if not await check_admin_filter(callback):
+        return await callback.answer("عدم دسترسی.", show_alert=True)
+    page = _extract_current_page(callback.message.text or "")
+    groups_info = await _fetch_groups_overview()
+    if not groups_info:
+        return await callback.answer("ℹ️ هیچ گروهی ثبت نشده است.", show_alert=True)
+    txt, kb = _render_groups_page(groups_info, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer("🔄 لیست به‌روزرسانی شد.")
+
+
+GROUP_USERS_PAGE_SIZE = 10
+# آخرین گروهی که هر ادمین با /group_users مشاهده کرده (برای پیمایش صفحات و به‌روزرسانی، بدون
+# نیاز به رمزگذاری نام گروه در callback_data که ممکن است حاوی فاصله/کاراکتر خاص باشد).
+_group_users_context: dict[int, str] = {}
+
+
+def _render_group_users_page(g_name: str, members, page: int):
+    total = len(members)
+    total_pages = max(1, math.ceil(total / GROUP_USERS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * GROUP_USERS_PAGE_SIZE
+    page_items = members[start:start + GROUP_USERS_PAGE_SIZE]
+
+    safe_g_name = html.escape(g_name)
+    txt = f"👥 <b>اعضای گروه «{safe_g_name}» (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"تعداد کل اعضا: <code>{total}</code> نفر\n\n"
+    for idx, u in enumerate(page_items, start=start + 1):
+        safe_full_name = html.escape(u["full_name"] or "ناشناس")
+        txt += f"<b>{idx}.</b> {safe_full_name} | <code>{u['user_id']}</code>\n"
+
+    kb = _build_pagination_keyboard(page, total_pages, "gu_page", refresh_data="gu_refresh")
+    return txt, kb
 
 
 @admin_router.message(Command("group_users"))
@@ -1305,57 +1999,98 @@ async def cmd_group_users(message: Message):
     if len(args) < 2:
         return await message.reply("استفاده: <code>/group_users [نام_گروه]</code>", parse_mode="HTML")
     g_name = args[1]
-    safe_g_name = html.escape(g_name)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT user_id, full_name, balance, is_frozen FROM users WHERE group_name = ?",
-            (g_name,),
+            "SELECT user_id, full_name FROM users WHERE group_name = ? ORDER BY user_id", (g_name,)
         ) as cur:
-            rows = await cur.fetchall()
-    if not rows:
+            members = await cur.fetchall()
+    if not members:
         return await message.reply("عضوی یافت نشد.")
-    txt = f"👥 <b>اعضای گروه {safe_g_name}:</b>\n"
-    for r in rows:
-        status = "❄️ فریز" if r["is_frozen"] else "🟢 فعال"
-        safe_full_name = html.escape(r['full_name'] or 'ناشناس')
-        txt += (
-            f"- <b>{safe_full_name}</b> | شماره حساب: <code>{r['user_id']}</code> | موجودی: <code>₳ {r['balance']}</code> | وضعیت: {status}\n"
-        )
-    await message.reply(txt, parse_mode="HTML")
+
+    _group_users_context[message.from_user.id] = g_name
+    txt, kb = _render_group_users_page(g_name, members, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data == "gu_page_noop")
+async def cb_group_users_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+async def _group_users_reload(callback: CallbackQuery, page: int):
+    if not await check_admin_filter(callback):
+        return await callback.answer("عدم دسترسی.", show_alert=True)
+    g_name = _group_users_context.get(callback.from_user.id)
+    if not g_name:
+        return await callback.answer("❌ ابتدا دستور /group_users [نام_گروه] را اجرا کنید.", show_alert=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT user_id, full_name FROM users WHERE group_name = ? ORDER BY user_id", (g_name,)
+        ) as cur:
+            members = await cur.fetchall()
+    if not members:
+        return await callback.answer("عضوی یافت نشد.", show_alert=True)
+
+    txt, kb = _render_group_users_page(g_name, members, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@admin_router.callback_query(F.data.startswith("gu_page_"))
+async def cb_group_users_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    await _group_users_reload(callback, page)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "gu_refresh")
+async def cb_group_users_refresh(callback: CallbackQuery):
+    page = _extract_current_page(callback.message.text or "")
+    await _group_users_reload(callback, page)
+    await callback.answer("🔄 لیست به‌روزرسانی شد.")
 
 
 @admin_router.message(Command("move_group"))
-async def cmd_move_group(message: Message):
+async def cmd_move_group(message: Message, state: FSMContext):
     if not is_private(message) or not await check_admin_filter(message):
         return
     args = message.text.split()
     if len(args) < 3:
         return await message.reply("استفاده: <code>/move_group [آیدی] [گروه]</code>", parse_mode="HTML")
-    t_id, g_name = int(args[1]), args[2]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET group_name = ? WHERE user_id = ?", (g_name, t_id)
-        )
-        await db.commit()
-    await message.reply("👑 کاربر به گروه جدید منتقل شد.")
+    try:
+        t_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ آیدی باید عدد صحیح باشد.")
+    g_name = args[2]
+    safe_g_name = html.escape(g_name)
+    preview_text = (
+        "🔀 <b>تأیید جابه‌جایی کاربر</b>\n"
+        f"آیا از انتقال کاربر با شناسه {t_id} به گروه «{safe_g_name}» اطمینان دارید؟"
+    )
+    await _start_ops_confirmation(message, state, "move_group", preview_text, op_user_id=t_id, op_group_name=g_name)
 
 
 @admin_router.message(Command("remove_group"))
-async def cmd_remove_group(message: Message):
+async def cmd_remove_group(message: Message, state: FSMContext):
     if not is_private(message) or not await check_admin_filter(message):
         return
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("استفاده: <code>/remove_group [آیدی]</code>", parse_mode="HTML")
-    t_id = int(args[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET group_name = 'Default' WHERE user_id = ?",
-            (t_id,),
-        )
-        await db.commit()
-    await message.reply("✅ کاربر به گروه پیش‌فرض برگردانده شد.")
+    try:
+        t_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ آیدی باید عدد صحیح باشد.")
+    preview_text = (
+        "↩️ <b>تأیید بازنشانی گروه کاربر</b>\n"
+        f"آیا می‌خواهید گروه کاربر {t_id} را حذف کرده و وضعیت او را به حالت پیش‌فرض (Default) برگردانید؟"
+    )
+    await _start_ops_confirmation(message, state, "remove_group", preview_text, op_user_id=t_id)
 
 
 @admin_router.message(Command("delete_group"))
@@ -1377,6 +2112,31 @@ async def cmd_delete_group(message: Message):
         await db.execute("DELETE FROM groups WHERE group_name = ?", (g_name,))
         await db.commit()
     await message.reply("🗑 گروه حذف شد و اعضا به Default منتقل شدند.")
+
+
+def _build_admin_give_take_dialog(data):
+    """متن و کیبورد صفحه «تأیید اولیه» مشترک بین /give و /take را می‌سازد (خلاصه عملیات + موجودی فعلی مقصد)."""
+    action = data["action"]
+    target = data["target"]
+    amount = data["amount"]
+    safe_target_name = html.escape(data.get("target_name") or "ناشناس")
+    safe_reason = html.escape(data["reason"])
+    current_balance = data.get("target_balance", 0)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید اولیه", callback_data="admin_yes"),
+        InlineKeyboardButton(text="❌ لغو", callback_data="admin_no"),
+    ]])
+    if action == "give":
+        text = (
+            f"💰 <b>تأیید واریز مستقیم</b>\n"
+            f"آیا از واریز مبلغ <code>₳ {amount}</code> به حساب کاربر <code>{target}</code> اطمینان دارید؟"
+        )
+    else:  # take
+        text = (
+            f"🔻 <b>هشدار کسر مستقیم از حساب</b>\n"
+            f"آیا از کسر مبلغ <code>₳ {amount}</code> از حساب کاربر <code>{target}</code> اطمینان دارید؟"
+        )
+    return text, kb
 
 
 @admin_router.message(Command("give"))
@@ -1409,33 +2169,37 @@ async def cmd_give(message: Message, state: FSMContext):
     if target_data["balance"] + amount > MAX_BALANCE_LIMIT:
         return await message.reply("❌ خطا: سقف موجودی مقصد.")
 
-    safe_target_name = html.escape(target_data['full_name'] or 'ناشناس')
-    safe_reason = html.escape(reason)
-
     await state.update_data(
         action="give",
         target=target,
         amount=amount,
         reason=reason,
         target_name=target_data["full_name"],
+        target_balance=target_data["balance"],
         admin_id=message.from_user.id,
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="✅ تایید", callback_data="admin_yes"),
-            InlineKeyboardButton(text="❌ انصراف", callback_data="admin_no"),
-        ]]
+
+    if target_data["is_frozen"]:
+        # ⚠️ مقصد فریز است: عملیات رد نمی‌شود، فقط قبل از ادامه هشدار داده می‌شود
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➡️ ادامه", callback_data="sfwarn_continue"),
+            InlineKeyboardButton(text="❌ لغو", callback_data="sfwarn_cancel"),
+        ]])
+        confirm_msg = await message.reply(
+            _frozen_target_card_text(target_data, target), reply_markup=kb, parse_mode="HTML"
+        )
+        await state.set_state(AdminConfirmForm.waiting_for_frozen_ack)
+    else:
+        data = await state.get_data()
+        text, kb = _build_admin_give_take_dialog(data)
+        confirm_msg = await message.reply(text, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(AdminConfirmForm.waiting_for_confirm)
+
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
     )
-    await message.reply(
-        f"⚠️ <b>تأیید واریز مدیریتی</b>\n\n"
-        f"👤 گیرنده: <b>{safe_target_name}</b> (<code>{target}</code>)\n"
-        f"💰 مبلغ: <code>₳ {amount}</code>\n"
-        f"📝 دلیل: {safe_reason}\n\n"
-        f"آیا مطمئن هستید؟",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-    await state.set_state(AdminConfirmForm.waiting_for_confirm)
 
 
 @admin_router.message(Command("take"))
@@ -1468,51 +2232,152 @@ async def cmd_take(message: Message, state: FSMContext):
     if target_data["balance"] < amount:
         return await message.reply("❌ موجودی ناکافی.")
 
-    safe_target_name = html.escape(target_data['full_name'] or 'ناشناس')
-    safe_reason = html.escape(reason)
-
     await state.update_data(
         action="take",
         target=target,
         amount=amount,
         reason=reason,
         target_name=target_data["full_name"],
+        target_balance=target_data["balance"],
         admin_id=message.from_user.id,
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="✅ تایید", callback_data="admin_yes"),
-            InlineKeyboardButton(text="❌ انصراف", callback_data="admin_no"),
-        ]]
+
+    if target_data["is_frozen"]:
+        # ⚠️ مقصد فریز است: عملیات رد نمی‌شود، فقط قبل از ادامه هشدار داده می‌شود
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➡️ ادامه", callback_data="sfwarn_continue"),
+            InlineKeyboardButton(text="❌ لغو", callback_data="sfwarn_cancel"),
+        ]])
+        confirm_msg = await message.reply(
+            _frozen_target_card_text(target_data, target), reply_markup=kb, parse_mode="HTML"
+        )
+        await state.set_state(AdminConfirmForm.waiting_for_frozen_ack)
+    else:
+        data = await state.get_data()
+        text, kb = _build_admin_give_take_dialog(data)
+        confirm_msg = await message.reply(text, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(AdminConfirmForm.waiting_for_confirm)
+
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
     )
-    await message.reply(
-        f"⚠️ <b>تأیید کسر مدیریتی</b>\n\n"
-        f"👤 از حساب: <b>{safe_target_name}</b> (<code>{target}</code>)\n"
-        f"💰 مبلغ: <code>₳ {amount}</code>\n"
-        f"📝 دلیل: {safe_reason}\n\n"
-        f"آیا مطمئن هستید؟",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-    await state.set_state(AdminConfirmForm.waiting_for_confirm)
 
 
-@admin_router.callback_query(AdminConfirmForm.waiting_for_confirm, F.data == "admin_yes")
-async def admin_confirm_yes(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    admin_id = data.get("admin_id")
-    if callback.from_user.id != admin_id:
-        return await callback.answer("❌ فقط خودتان می‌توانید تأیید کنید.", show_alert=True)
-
-    await state.clear()
+async def _execute_admin_confirmed_action(callback: CallbackQuery, data: dict, admin_id: int) -> None:
+    """اجرای واقعی عملیات give/take/treasury_add/treasury_sub/rewardgroup پس از تکمیل مراحل تأیید (ادیت پیام اولیه به نتیجه نهایی)."""
     action = data["action"]
-    target = data["target"]
+
+    if action == "rewardgroup":
+        # 📦 توزیع گروهی پاداش: هر عضو با تراکنش مستقل (BEGIN/COMMIT جداگانه)، دقیقاً مطابق
+        # معماری اصلی این دستور؛ فقط اکنون بر اساس انتخاب کاربر، اعضای فریز هم می‌توانند
+        # جزو دریافت‌کنندگان باشند (بدون رد خودکار).
+        g_name = data["gop_group"]
+        amount = data["gop_amount"]
+        reason = data["gop_reason"]
+        include_frozen = data.get("gop_include_frozen", False)
+        normal_members = data["gop_normal_members"]
+        frozen_members = data["gop_frozen_members"] if include_frozen else []
+        recipients = list(normal_members) + list(frozen_members)
+
+        safe_g_name = html.escape(g_name)
+        success_p, failed_p, total_dist = 0, 0, 0
+
+        async with db_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                for u in recipients:
+                    try:
+                        await db.execute("BEGIN IMMEDIATE")
+                        sub_tx_id = f"TX-G-{str(uuid.uuid4()).upper()[:12]}"
+                        await db.execute(
+                            "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                            (amount, u["user_id"]),
+                        )
+                        await db.execute(
+                            """
+                            INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason, status)
+                            VALUES (?, ?, 0, ?, ?, ?, 'SUCCESS')
+                        """,
+                            (
+                                sub_tx_id,
+                                datetime.now(timezone.utc).isoformat(),
+                                u["user_id"],
+                                amount,
+                                f"پاداش گروه [{g_name}]: {reason}",
+                            ),
+                        )
+                        await db.commit()
+                        success_p += 1
+                        total_dist += amount
+                    except Exception:
+                        await db.execute("ROLLBACK")
+                        failed_p += 1
+
+        await callback.message.edit_text(
+            f"📊 <b>گزارش واریز گروهی ({safe_g_name}):</b>\n\n"
+            f"✅ موفق: <code>{success_p}</code> کاربر\n"
+            f"❌ خطا: <code>{failed_p}</code> کاربر\n"
+            f"💰 توزیع شده: <code>₳ {total_dist}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    target = data.get("target")
     amount = data["amount"]
     reason = data["reason"]
-    target_name = data.get("target_name", str(target))
+    target_name = data.get("target_name", str(target) if target is not None else "")
 
     safe_target_name = html.escape(target_name)
     safe_reason = html.escape(reason)
+
+    if action in ("treasury_add", "treasury_sub"):
+        async with db_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                if action == "treasury_add":
+                    treasury_balance = await get_treasury_balance()
+                    if treasury_balance + amount > MAX_BALANCE_LIMIT:
+                        return await callback.message.edit_text("❌ خطا: سقف موجودی خزانه.")
+                    await treasury_credit(
+                        db, amount, f"افزایش دستی خزانه توسط سوپرادمین: {reason}", related_user=admin_id
+                    )
+                    await db.commit()
+                    result_text = (
+                        f"✅ به خزانه مرکزی واریز شد.\n💰 مبلغ: <code>₳ {amount}</code>\n📝 دلیل: {safe_reason}"
+                    )
+                    notify_text = (
+                        f"📢 <b>عملیات سوپرادمین</b>\n\n"
+                        f"👑 ادمین: <code>{admin_id}</code>\n"
+                        f"➕ افزایش موجودی خزانه مرکزی\n"
+                        f"💰 مبلغ: <code>₳ {amount}</code>\n"
+                        f"📝 دلیل: {safe_reason}"
+                    )
+                else:  # treasury_sub
+                    ok = await treasury_debit(
+                        db, amount, f"کاهش دستی خزانه توسط سوپرادمین: {reason}", related_user=admin_id
+                    )
+                    await db.commit()
+                    if not ok:
+                        return await callback.message.edit_text("❌ موجودی خزانه کافی نیست.")
+                    result_text = (
+                        f"🔥 از خزانه مرکزی کسر شد.\n💰 مبلغ: <code>₳ {amount}</code>\n📝 دلیل: {safe_reason}"
+                    )
+                    notify_text = (
+                        f"📢 <b>عملیات سوپرادمین</b>\n\n"
+                        f"👑 ادمین: <code>{admin_id}</code>\n"
+                        f"➖ کاهش موجودی خزانه مرکزی\n"
+                        f"💰 مبلغ: <code>₳ {amount}</code>\n"
+                        f"📝 دلیل: {safe_reason}"
+                    )
+
+        await callback.message.edit_text(result_text, parse_mode="HTML")
+        for sa_id in SUPER_ADMINS:
+            if sa_id != admin_id:
+                try:
+                    await callback.bot.send_message(sa_id, notify_text, parse_mode="HTML")
+                except Exception:
+                    pass
+        return
 
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1525,6 +2390,7 @@ async def admin_confirm_yes(callback: CallbackQuery, state: FSMContext):
             if not u:
                 return await callback.message.edit_text("❌ کاربر یافت نشد.")
 
+            # ⚠️ کاربر فریزشده هم دقیقاً مانند کاربر عادی پرداخت/کسر می‌شود (بدون لغو خودکار)
             if action == "give":
                 if u["balance"] + amount > MAX_BALANCE_LIMIT:
                     return await callback.message.edit_text("❌ خطا: سقف موجودی.")
@@ -1580,18 +2446,262 @@ async def admin_confirm_yes(callback: CallbackQuery, state: FSMContext):
                 pass
 
 
+def _build_admin_final_dialog(data):
+    """متن و کیبورد صفحه «تأیید نهایی» مشترک بین /give، /take و /rewardgroup (مرحله آخر پیش از اجرا)."""
+    action = data["action"]
+
+    if action == "rewardgroup":
+        g_name = data["gop_group"]
+        amount = data["gop_amount"]
+        include_frozen = data.get("gop_include_frozen", False)
+        normal_count = len(data["gop_normal_members"])
+        frozen_count = len(data["gop_frozen_members"]) if include_frozen else 0
+        recipient_count = normal_count + frozen_count
+        total = recipient_count * amount
+        safe_g_name = html.escape(g_name)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ تأیید نهایی", callback_data="admin_final_yes"),
+            InlineKeyboardButton(text="❌ لغو", callback_data="admin_final_no"),
+        ]])
+        text = (
+            f"⚠️ <b>تأیید نهایی</b>\n\n"
+            f"با تأیید نهایی، مبلغ <code>₳ {amount}</code> به <code>{recipient_count}</code> نفر از گروه «<b>{safe_g_name}</b>» "
+            f"(مجموعاً <code>₳ {total}</code>) واریز خواهد شد.\n"
+            f"این عملیات قابل بازگشت نیست.\n\n"
+            f"آیا کاملاً مطمئن هستید؟"
+        )
+        return text, kb
+
+    target = data["target"]
+    amount = data["amount"]
+    safe_target_name = html.escape(data.get("target_name") or "ناشناس")
+    verb = "واریز" if action == "give" else "کسر"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید نهایی", callback_data="admin_final_yes"),
+        InlineKeyboardButton(text="❌ لغو", callback_data="admin_final_no"),
+    ]])
+    text = (
+        f"⚠️ <b>تأیید نهایی</b>\n\n"
+        f"با تأیید نهایی، مبلغ <code>₳ {amount}</code> برای <b>{safe_target_name}</b> (<code>{target}</code>) {verb} خواهد شد.\n"
+        f"این عملیات قابل بازگشت نیست.\n\n"
+        f"آیا کاملاً مطمئن هستید؟"
+    )
+    return text, kb
+
+
+@admin_router.callback_query(AdminConfirmForm.waiting_for_confirm, F.data == "admin_yes")
+async def admin_confirm_yes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید تأیید کنید.", show_alert=True)
+
+    action = data["action"]
+
+    if action in ("give", "take", "rewardgroup"):
+        # ⚠️ طبق فلوی جدید، پس از «تأیید اولیه» باید «تأیید نهایی» روی همان پیام نمایش داده
+        # شود؛ اجرای واقعی فقط پس از تأیید نهایی انجام می‌شود.
+        cancel_input_timeout(callback.message.chat.id, admin_id)
+        text, kb = _build_admin_final_dialog(data)
+        try:
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
+        current_state = await state.get_state()
+        schedule_input_timeout(
+            state, callback.message.chat.id, admin_id, current_state,
+            lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+        )
+        return await callback.answer()
+
+    # سایر اکشن‌ها (treasury_add/treasury_sub) بدون تغییر: همچنان تک‌مرحله‌ای اجرا می‌شوند
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    await state.clear()
+    await _execute_admin_confirmed_action(callback, data, admin_id)
+
+
+@admin_router.callback_query(AdminConfirmForm.waiting_for_confirm, F.data == "admin_final_yes")
+async def admin_confirm_final_yes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید تأیید کنید.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    await state.clear()
+    await _execute_admin_confirmed_action(callback, data, admin_id)
+
+
+@admin_router.callback_query(AdminConfirmForm.waiting_for_confirm, F.data == "admin_final_no")
+async def admin_confirm_final_no(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید لغو کنید.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    await state.clear()
+    await callback.message.edit_text("❌ عملیات لغو شد.")
+
+
 @admin_router.callback_query(AdminConfirmForm.waiting_for_confirm, F.data == "admin_no")
 async def admin_confirm_no(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     admin_id = data.get("admin_id")
     if callback.from_user.id != admin_id:
         return await callback.answer("❌ فقط خودتان می‌توانید لغو کنید.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, admin_id)
     await state.clear()
     await callback.message.edit_text("❌ عملیات لغو شد.")
 
 
+# =====================================================================================
+# ⚠️ هندلرهای مشترک «هشدار اولیه فریز» برای دستورات تک‌نفره (give/take/treasury_give/treasury_take)
+# =====================================================================================
+@admin_router.callback_query(AdminConfirmForm.waiting_for_frozen_ack, F.data == "sfwarn_continue")
+async def cb_admin_frozen_continue(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید ادامه دهید.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    text, kb = _build_admin_give_take_dialog(data)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await state.set_state(AdminConfirmForm.waiting_for_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, admin_id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(AdminConfirmForm.waiting_for_frozen_ack, F.data == "sfwarn_cancel")
+async def cb_admin_frozen_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید لغو کنید.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    await state.clear()
+    await callback.message.edit_text("❌ عملیات لغو شد.")
+
+
+# =====================================================================================
+# ⚠️ ابزار و هندلرهای مشترک هشدار/انتخاب فریز برای عملیات گروهی (rewardgroup و group_salary)
+# =====================================================================================
+def _build_group_path_dialog(kind: str, g_name: str, amount: int, normal_count: int, frozen_count: int, include_frozen: bool):
+    """متن و کیبورد مرحله «تأیید اولیه» عملیات گروهی را می‌سازد (بر اساس مسیر انتخاب‌شده)."""
+    safe_g_name = html.escape(g_name)
+    if frozen_count == 0:
+        total = normal_count * amount
+        if kind == "rewardgroup":
+            text = (
+                f"🎁 <b>تأیید واریز همگانی</b>\n"
+                f"آیا از واریز مبلغ <code>₳ {amount}</code> به حساب تمام اعضای گروه «{safe_g_name}» "
+                f"(تعداد: {normal_count} نفر) اطمینان دارید؟"
+            )
+        else:
+            text = (
+                f"⚠️ <b>تأیید عملیات گروهی</b>\n\n"
+                f"👥 گروه/دسته‌بندی: <b>{safe_g_name}</b>\n"
+                f"👤 تعداد اعضا: <code>{normal_count}</code>\n"
+                f"💰 مبلغ فردی: <code>₳ {amount}</code>\n"
+                f"🧮 مجموع: <code>₳ {total}</code>\n\n"
+                f"آیا تأیید می‌کنید؟"
+            )
+    elif include_frozen:
+        total = (normal_count + frozen_count) * amount
+        text = (
+            f"👤 <code>{normal_count}</code> کاربر عادی و <code>{frozen_count}</code> کاربر فریز وجود دارد "
+            f"که به آن‌ها پول انتقال داده می‌شود.\n"
+            f"💰 مبلغ فردی: <code>₳ {amount}</code> | 🧮 مجموع: <code>₳ {total}</code>\n\n"
+            f"آیا تأیید می‌کنید؟"
+        )
+    else:
+        total = normal_count * amount
+        text = (
+            f"آیا مطمئن هستید که می‌خواهید فقط به کاربران بدون فریز پول انتقال دهید؟\n\n"
+            f"👤 تعداد: <code>{normal_count}</code> نفر\n"
+            f"💰 مبلغ فردی: <code>₳ {amount}</code> | 🧮 مجموع: <code>₳ {total}</code>"
+        )
+
+    if kind == "rewardgroup":
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ تأیید اولیه", callback_data="admin_yes"),
+            InlineKeyboardButton(text="❌ لغو", callback_data="admin_no"),
+        ]])
+    else:  # group_salary
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ تأیید اولیه", callback_data="gsalary_yes"),
+            InlineKeyboardButton(text="❌ لغو", callback_data="gsalary_no"),
+        ]])
+    return text, kb
+
+
+_GROUP_FROZEN_ACK_STATES = StateFilter(AdminConfirmForm.waiting_for_frozen_ack, TreasuryConfirmForm.waiting_for_frozen_ack)
+
+
+@admin_router.callback_query(_GROUP_FROZEN_ACK_STATES, F.data == "gfwarn_noop")
+async def cb_group_frozen_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@admin_router.callback_query(_GROUP_FROZEN_ACK_STATES, F.data.startswith("gfwarn_page_"))
+async def cb_group_frozen_page(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید صفحات را تغییر دهید.", show_alert=True)
+
+    page = int(callback.data[len("gfwarn_page_"):])
+    text, kb = _group_frozen_warning_page(
+        len(data["gop_normal_members"]), data["gop_frozen_members"], page, data["gop_group"], data["gop_amount"]
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@admin_router.callback_query(_GROUP_FROZEN_ACK_STATES, F.data.in_(["gfwarn_include", "gfwarn_exclude"]))
+async def cb_group_frozen_choice(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید انتخاب کنید.", show_alert=True)
+
+    include_frozen = (callback.data == "gfwarn_include")
+    kind = data.get("action", "group_salary")
+    g_name = data["gop_group"]
+    amount = data["gop_amount"]
+    normal_count = len(data["gop_normal_members"])
+    frozen_count = len(data["gop_frozen_members"])
+
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    await state.update_data(gop_include_frozen=include_frozen)
+
+    text, kb = _build_group_path_dialog(kind, g_name, amount, normal_count, frozen_count, include_frozen)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+    new_state = AdminConfirmForm.waiting_for_confirm if kind == "rewardgroup" else TreasuryConfirmForm.waiting_for_confirm
+    await state.set_state(new_state)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, admin_id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
+    await callback.answer()
+
+
 @admin_router.message(Command("rewardgroup"))
-async def cmd_reward_group(message: Message):
+async def cmd_reward_group(message: Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return await message.reply("❌ این دستور فقط مخصوص سوپرادمین است.")
 
@@ -1602,73 +2712,57 @@ async def cmd_reward_group(message: Message):
             parse_mode="HTML"
         )
 
-    g_name, amount = args[1], int(args[2])
+    g_name = args[1]
+    try:
+        amount = int(args[2])
+    except ValueError:
+        return await message.reply("❌ مقدار نامعتبر است.")
     reason = args[3] if len(args) > 3 else "پاداش گروهی مدیریت"
     if amount <= 0:
         return await message.reply("❌ مقدار نامعتبر است.")
 
-    safe_g_name = html.escape(g_name)
-
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT user_id, is_frozen FROM users WHERE group_name = ?",
+            "SELECT user_id, full_name, username, is_frozen FROM users WHERE group_name = ?",
             (g_name,),
         ) as cur:
-            users = await cur.fetchall()
+            all_members = await cur.fetchall()
 
-    if not users:
+    if not all_members:
         return await message.reply("❌ هیچ کاربری در این گروه یافت نشد.")
 
-    success_p, skipped_p, failed_p, total_dist = 0, 0, 0, 0
+    normal_members = [m for m in all_members if not m["is_frozen"]]
+    frozen_members = [m for m in all_members if m["is_frozen"]]
 
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            for u in users:
-                try:
-                    if u["is_frozen"]:
-                        skipped_p += 1
-                        continue
+    await state.update_data(
+        action="rewardgroup",
+        gop_group=g_name,
+        gop_amount=amount,
+        gop_reason=reason,
+        gop_normal_members=normal_members,
+        gop_frozen_members=frozen_members,
+        admin_id=message.from_user.id,
+    )
 
-                    await db.execute("BEGIN IMMEDIATE")
-                    sub_tx_id = f"TX-G-{str(uuid.uuid4()).upper()[:12]}"
-                    await db.execute(
-                        "UPDATE users SET balance = balance + ? WHERE user_id"
-                        " = ?",
-                        (amount, u["user_id"]),
-                    )
-                    await db.execute(
-                        """
-                        INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason, status)
-                        VALUES (?, ?, 0, ?, ?, ?, 'SUCCESS')
-                    """,
-                        (
-                            sub_tx_id,
-                            datetime.now(timezone.utc).isoformat(),
-                            u["user_id"],
-                            amount,
-                            f"پاداش گروه [{g_name}]: {reason}",
-                        ),
-                    )
-                    await db.commit()
-                    success_p += 1
-                    total_dist += amount
-                except Exception:
-                    await db.execute("ROLLBACK")
-                    failed_p += 1
+    if frozen_members:
+        text, kb = _group_frozen_warning_page(len(normal_members), frozen_members, 0, g_name, amount)
+        confirm_msg = await message.reply(text, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(AdminConfirmForm.waiting_for_frozen_ack)
+    else:
+        text, kb = _build_group_path_dialog("rewardgroup", g_name, amount, len(normal_members), 0, False)
+        confirm_msg = await message.reply(text, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(AdminConfirmForm.waiting_for_confirm)
 
-    await message.reply(
-        f"📊 <b>گزارش واریز گروهی ({safe_g_name}):</b>\n\n"
-        f"✅ موفق: <code>{success_p}</code> کاربر\n"
-        f"❄️ اسکیپ (فریز): <code>{skipped_p}</code> کاربر\n"
-        f"❌ خطا: <code>{failed_p}</code> کاربر\n"
-        f"💰 توزیع شده: <code>₳ {total_dist}</code>",
-        parse_mode="HTML",
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
     )
 
 
 @admin_router.message(Command("undo"))
-async def cmd_undo(message: Message):
+async def cmd_undo(message: Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return await message.reply("❌ این دستور فقط مخصوص سوپرادمین است.")
     args = message.text.split(maxsplit=2)
@@ -1681,75 +2775,24 @@ async def cmd_undo(message: Message):
     tx_id = args[1]
     reason = args[2] if len(args) > 2 else "لغو تراکنش توسط مدیریت ارشد"
 
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("BEGIN IMMEDIATE")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT from_user, to_user, amount, status FROM audit_logs WHERE tx_id = ?", (tx_id,)
+        ) as cur:
+            tx = await cur.fetchone()
 
-            async with db.execute(
-                "SELECT from_user, to_user, amount, status FROM audit_logs"
-                " WHERE tx_id = ?",
-                (tx_id,),
-            ) as cur:
-                tx = await cur.fetchone()
+    if not tx:
+        return await message.reply("❌ تراکنشی با این شناسه یافت نشد.")
+    if tx["status"] == "REFUNDED":
+        return await message.reply("❌ این تراکنش قبلاً باطل شده است.")
 
-            if not tx:
-                await db.execute("ROLLBACK")
-                return await message.reply("❌ تراکنشی با این شناسه یافت نشد.")
-            if tx["status"] == "REFUNDED":
-                await db.execute("ROLLBACK")
-                return await message.reply("❌ این تراکنش قبلاً باطل شده است.")
-
-            f_user, t_user, amount = tx["from_user"], tx["to_user"], tx["amount"]
-
-            if t_user != 0:
-                async with db.execute(
-                    "SELECT balance FROM users WHERE user_id = ?", (t_user,)
-                ) as cur_t:
-                    target = await cur_t.fetchone()
-                if not target or target["balance"] < amount:
-                    await db.execute("ROLLBACK")
-                    return await message.reply(
-                        "❌ خطا: موجودی گیرنده برای برگشت زدن کافی نیست."
-                    )
-
-                await db.execute(
-                    "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-                    (amount, t_user),
-                )
-
-            if f_user != 0:
-                await db.execute(
-                    "UPDATE users SET balance = balance + ? WHERE user_id = ?",
-                    (amount, f_user),
-                )
-
-            new_tx_id = f"TX-REV-{str(uuid.uuid4()).upper()[:10]}"
-            await db.execute(
-                "UPDATE audit_logs SET status = 'REFUNDED' WHERE tx_id = ?",
-                (tx_id,),
-            )
-            await db.execute(
-                """
-                INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason, status)
-                VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS')
-            """,
-                (
-                    new_tx_id,
-                    datetime.now(timezone.utc).isoformat(),
-                    t_user,
-                    f_user,
-                    amount,
-                    f"برگشت تراکنش {tx_id}: {reason}",
-                ),
-            )
-
-            await db.commit()
-
-    await message.reply(
-        f"🔄 تراکنش با موفقیت معکوس شد.\n🔖 شناسه برگشتی: <code>{new_tx_id}</code>",
-        parse_mode="HTML",
+    safe_tx_id = html.escape(tx_id)
+    preview_text = (
+        "🔄 <b>هشدار بازگردانی تراکنش</b>\n"
+        f"آیا از لغو و معکوس‌سازی تراکنش {safe_tx_id} مطمئن هستید؟ مبالغ به حساب اولیه بازخواهند گشت."
     )
+    await _start_ops_confirmation(message, state, "undo_tx", preview_text, op_tx_id=tx_id, op_reason=reason)
 
 
 @admin_router.message(Command("economy"))
@@ -1782,36 +2825,946 @@ async def cmd_economy(message: Message):
     )
 
 
+TREASURY_TX_PAGE_SIZE = 10
+
+
+def _render_treasury_page(treasury_balance: int, txs, page: int):
+    total = len(txs)
+    total_pages = max(1, math.ceil(total / TREASURY_TX_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * TREASURY_TX_PAGE_SIZE
+    page_items = txs[start:start + TREASURY_TX_PAGE_SIZE]
+
+    txt = f"🏛 <b>تاریخچه تراکنش‌های خزانه مرکزی (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"موجودی فعلی خزانه: <code>₳ {treasury_balance}</code>\n\n"
+    if not page_items:
+        txt += "📜 هیچ تراکنشی ثبت نشده است."
+    for tx in page_items:
+        direction = "➕ ورودی" if tx["to_user"] == TREASURY_USER_ID else "➖ خروجی"
+        safe_reason = html.escape(tx["reason"] or "-")
+        txt += (
+            f"🔹 <code>{tx['tx_id']}</code> | {direction} | <code>₳ {tx['amount']}</code> | "
+            f"{safe_reason} | <code>{tx['timestamp']}</code>\n"
+        )
+
+    kb = _build_pagination_keyboard(page, total_pages, "treasury_page", refresh_data="treasury_refresh")
+    return txt, kb
+
+
+async def _fetch_treasury_view():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT balance FROM users WHERE user_id = ?", (TREASURY_USER_ID,)
+        ) as cur:
+            treasury_user = await cur.fetchone()
+
+        async with db.execute(
+            "SELECT tx_id, timestamp, from_user, to_user, amount, reason FROM audit_logs "
+            "WHERE from_user = ? OR to_user = ? ORDER BY timestamp DESC",
+            (TREASURY_USER_ID, TREASURY_USER_ID)
+        ) as cur2:
+            txs = await cur2.fetchall()
+
+    treasury_balance = treasury_user["balance"] if treasury_user else 0
+    return treasury_balance, txs
+
+
+@admin_router.message(Command("treasury"))
+async def cmd_treasury(message: Message):
+    if not is_private(message):
+        return
+    user_id = message.from_user.id
+    if not (is_super_admin(user_id) or user_id == TREASURY_USER_ID):
+        return await message.reply("❌ این دستور فقط مخصوص سوپرادمین‌ها و حساب خزانه مرکزی است.")
+
+    treasury_balance, txs = await _fetch_treasury_view()
+    txt, kb = _render_treasury_page(treasury_balance, txs, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data == "treasury_page_noop")
+async def cb_treasury_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+async def _treasury_reload(callback: CallbackQuery, page: int):
+    user_id = callback.from_user.id
+    if not (is_super_admin(user_id) or user_id == TREASURY_USER_ID):
+        return await callback.answer("عدم دسترسی.", show_alert=True)
+    treasury_balance, txs = await _fetch_treasury_view()
+    txt, kb = _render_treasury_page(treasury_balance, txs, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@admin_router.callback_query(F.data.startswith("treasury_page_"))
+async def cb_treasury_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    await _treasury_reload(callback, page)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "treasury_refresh")
+async def cb_treasury_refresh(callback: CallbackQuery):
+    page = _extract_current_page(callback.message.text or "")
+    await _treasury_reload(callback, page)
+    await callback.answer("🔄 لیست به‌روزرسانی شد.")
+
+
+@admin_router.message(Command("treasury_add"))
+async def cmd_treasury_add(message: Message, state: FSMContext):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        return await message.reply(
+            "❌ ساختار: <code>/treasury_add [مقدار] [دلیل_اختیاری]</code>", parse_mode="HTML"
+        )
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return await message.reply("❌ ورودی نامعتبر.")
+    reason = args[2] if len(args) > 2 else "افزایش دستی خزانه توسط سوپرادمین"
+    if amount <= 0:
+        return await message.reply("❌ مقدار باید مثبت باشد.")
+
+    treasury_balance = await get_treasury_balance()
+    if treasury_balance + amount > MAX_BALANCE_LIMIT:
+        return await message.reply("❌ خطا: سقف موجودی خزانه.")
+
+    safe_reason = html.escape(reason)
+    await state.update_data(
+        action="treasury_add", amount=amount, reason=reason, admin_id=message.from_user.id,
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ تایید", callback_data="admin_yes"),
+            InlineKeyboardButton(text="❌ انصراف", callback_data="admin_no"),
+        ]]
+    )
+    confirm_msg = await message.reply(
+        f"🏛 <b>تأیید افزایش موجودی خزانه</b>\n"
+        f"مبلغ: <code>₳ {amount}</code> | دلیل: {safe_reason}\n"
+        f"آیا این تراکنش ورودی به خزانه مرکزی را تأیید می‌کنید؟",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminConfirmForm.waiting_for_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
+    )
+
+
+@admin_router.message(Command("treasury_sub"))
+async def cmd_treasury_sub(message: Message, state: FSMContext):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        return await message.reply(
+            "❌ ساختار: <code>/treasury_sub [مقدار] [دلیل_اختیاری]</code>", parse_mode="HTML"
+        )
+    try:
+        amount = int(args[1])
+    except ValueError:
+        return await message.reply("❌ ورودی نامعتبر.")
+    reason = args[2] if len(args) > 2 else "کاهش دستی خزانه توسط سوپرادمین"
+    if amount <= 0:
+        return await message.reply("❌ مقدار باید مثبت باشد.")
+
+    treasury_balance = await get_treasury_balance()
+    if treasury_balance < amount:
+        return await message.reply("❌ موجودی خزانه کافی نیست.")
+
+    safe_reason = html.escape(reason)
+    await state.update_data(
+        action="treasury_sub", amount=amount, reason=reason, admin_id=message.from_user.id,
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ تایید", callback_data="admin_yes"),
+            InlineKeyboardButton(text="❌ انصراف", callback_data="admin_no"),
+        ]]
+    )
+    confirm_msg = await message.reply(
+        f"🚨 <b>هشدار برداشت از خزانه مرکزی</b>\n"
+        f"مبلغ: <code>₳ {amount}</code> | دلیل: {safe_reason}\n"
+        f"آیا از کسر این مبلغ از خزانه مرکزی اطمینان دارید؟",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminConfirmForm.waiting_for_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
+    )
+
+
+# =====================================================================================
+# 🏛 دستور /treasury_give: انتقال مستقیم و یک‌باره از خزانه مرکزی به یک کاربر
+# =====================================================================================
+def _build_tgive_dialog(target: int, target_name: str, amount: int, treasury_balance: int, token: str):
+    """متن و کیبورد مرحله «تأیید اولیه» برای /treasury_give."""
+    safe_target_name = html.escape(target_name or "ناشناس")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید اولیه", callback_data=f"tgive_yes_{token}"),
+        InlineKeyboardButton(text="❌ لغو", callback_data=f"tgive_no_{token}"),
+    ]])
+    text = (
+        f"⚠️ <b>تأیید انتقال از خزانه مرکزی</b>\n\n"
+        f"👤 گیرنده: <b>{safe_target_name}</b> (<code>{target}</code>)\n"
+        f"💰 مبلغ: <code>₳ {amount}</code>\n"
+        f"🏛 موجودی فعلی خزانه: <code>₳ {treasury_balance}</code>\n\n"
+        f"آیا مطمئن هستید؟"
+    )
+    return text, kb
+
+
+def _build_tgive_final_dialog(target: int, amount: int, token: str):
+    """متن و کیبورد مرحله «تأیید نهایی» برای /treasury_give."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید نهایی", callback_data=f"tgive_final_yes_{token}"),
+        InlineKeyboardButton(text="❌ لغو", callback_data=f"tgive_final_no_{token}"),
+    ]])
+    text = (
+        f"⚠️ <b>تأیید نهایی</b>\n\n"
+        f"با تأیید نهایی، مبلغ <code>₳ {amount}</code> از خزانه مرکزی به حساب <code>{target}</code> واریز خواهد شد.\n"
+        f"این عملیات قابل بازگشت نیست.\n\n"
+        f"آیا کاملاً مطمئن هستید؟"
+    )
+    return text, kb
+
+
+@admin_router.message(Command("treasury_give"))
+async def cmd_treasury_give(message: Message, state: FSMContext):
+    if not is_private(message):
+        return
+    if message.from_user.id != TREASURY_USER_ID:
+        return
+
+    text = message.text.strip()
+    if text.startswith("/treasury_give"):
+        text = text[len("/treasury_give"):].strip()
+
+    # حالت ریپلای روی پیام کاربر: فقط مبلغ لازم است
+    if message.reply_to_message and message.reply_to_message.from_user:
+        try:
+            amount = int(text)
+        except ValueError:
+            return await message.reply("❌ مبلغ وارد شده نامعتبر است.")
+        target = message.reply_to_message.from_user.id
+    else:
+        parts = text.split()
+        if len(parts) < 2:
+            return await message.reply(
+                "❌ ساختار: <code>/treasury_give [آیدی] [مبلغ]</code>\n"
+                "یا با ریپلای روی پیام کاربر: <code>/treasury_give [مبلغ]</code>",
+                parse_mode="HTML",
+            )
+        try:
+            target, amount = int(parts[0]), int(parts[1])
+        except ValueError:
+            return await message.reply("❌ آیدی و مبلغ باید عدد صحیح باشند.")
+
+    if amount <= 0 or amount > MAX_BALANCE_LIMIT:
+        return await message.reply("❌ مبلغ باید یک عدد صحیح مثبت و کمتر از سقف مجاز باشد.")
+    if target == TREASURY_USER_ID:
+        return await message.reply("❌ امکان انتقال از خزانه به خودش وجود ندارد.")
+
+    target_data = await get_user_data(target)
+    if not target_data:
+        return await message.reply("❌ کاربر مقصد یافت نشد.")
+
+    treasury_balance = await get_treasury_balance()
+    if treasury_balance < amount:
+        return await message.reply("❌ موجودی خزانه کافی نیست.")
+    if target_data["balance"] + amount > MAX_BALANCE_LIMIT:
+        return await message.reply("❌ خطا: سقف موجودی مقصد.")
+
+    # 🔐 شناسه یکتا برای جلوگیری از اجرای تکراری/کلیک روی دکمه‌های قدیمی
+    token = uuid.uuid4().hex[:12]
+    await state.update_data(
+        tgive_target=target, tgive_amount=amount, tgive_token=token,
+        tgive_target_name=target_data["full_name"], tgive_treasury_balance=treasury_balance,
+    )
+
+    if target_data["is_frozen"]:
+        # ⚠️ مقصد فریز است: عملیات رد نمی‌شود، فقط قبل از ادامه هشدار داده می‌شود
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➡️ ادامه", callback_data=f"tgive_frozen_yes_{token}"),
+            InlineKeyboardButton(text="❌ لغو", callback_data=f"tgive_frozen_no_{token}"),
+        ]])
+        confirm_msg = await message.reply(
+            _frozen_target_card_text(target_data, target), reply_markup=kb, parse_mode="HTML"
+        )
+        await state.set_state(TreasuryConfirmForm.waiting_for_frozen_ack)
+    else:
+        dtext, kb = _build_tgive_dialog(target, target_data["full_name"], amount, treasury_balance, token)
+        confirm_msg = await message.reply(dtext, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(TreasuryConfirmForm.waiting_for_confirm)
+
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
+    )
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_frozen_ack, F.data.startswith("tgive_frozen_yes_"))
+async def cb_treasury_give_frozen_yes(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند ادامه دهد.", show_alert=True)
+    data = await state.get_data()
+    token = callback.data[len("tgive_frozen_yes_"):]
+    if not data or token != data.get("tgive_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    text, kb = _build_tgive_dialog(
+        data["tgive_target"], data.get("tgive_target_name"), data["tgive_amount"], data["tgive_treasury_balance"], token
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await state.set_state(TreasuryConfirmForm.waiting_for_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, callback.from_user.id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_frozen_ack, F.data.startswith("tgive_frozen_no_"))
+async def cb_treasury_give_frozen_no(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند لغو کند.", show_alert=True)
+    data = await state.get_data()
+    token = callback.data[len("tgive_frozen_no_"):]
+    if not data or token != data.get("tgive_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    await state.clear()
+    await callback.message.edit_text("❌ انتقال از خزانه لغو شد.")
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data.startswith("tgive_yes_"))
+async def cb_treasury_give_yes(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند تأیید کند.", show_alert=True)
+
+    data = await state.get_data()
+    token = callback.data[len("tgive_yes_"):]
+    if not data or token != data.get("tgive_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+
+    # ⚠️ طبق فلوی جدید، پس از «تأیید اولیه» باید «تأیید نهایی» نمایش داده شود؛ اجرا فقط بعد از آن است
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    text, kb = _build_tgive_final_dialog(data["tgive_target"], data["tgive_amount"], token)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, callback.from_user.id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data.startswith("tgive_final_yes_"))
+async def cb_treasury_give_final_yes(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند تأیید کند.", show_alert=True)
+
+    data = await state.get_data()
+    token = callback.data[len("tgive_final_yes_"):]
+    if not data or token != data.get("tgive_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    await state.clear()
+
+    target = data["tgive_target"]
+    amount = data["tgive_amount"]
+
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (target,)) as cur_u:
+                target_row = await cur_u.fetchone()
+
+            if not target_row or target_row["balance"] + amount > MAX_BALANCE_LIMIT:
+                await db.rollback()
+                return await callback.message.edit_text("❌ خطا در وضعیت حساب مقصد؛ تراکنش لغو شد.")
+
+            # 🏛 کسر از خزانه (با ثبت خودکار یک ردیف audit_log توسط همین تابع)
+            ok = await treasury_debit(
+                db, amount, f"[TREASURY_GIVE] انتقال مستقیم خزانه به کاربر {target}", related_user=target
+            )
+            if not ok:
+                await db.rollback()
+                return await callback.message.edit_text("❌ موجودی خزانه کافی نیست.")
+
+            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target))
+            await db.commit()
+
+    await callback.message.edit_text(
+        f"✅ مبلغ <code>₳ {amount}</code> از خزانه مرکزی به حساب <code>{target}</code> واریز شد.",
+        parse_mode="HTML",
+    )
+    try:
+        await callback.bot.send_message(
+            target,
+            f"🏛 مبلغ <code>₳ {amount}</code> از خزانه مرکزی آترامنتوم به حساب شما واریز شد.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data.startswith("tgive_final_no_"))
+async def cb_treasury_give_final_no(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند لغو کند.", show_alert=True)
+    data = await state.get_data()
+    token = callback.data[len("tgive_final_no_"):]
+    if not data or token != data.get("tgive_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    await state.clear()
+    await callback.message.edit_text("❌ انتقال از خزانه لغو شد.")
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data.startswith("tgive_no_"))
+async def cb_treasury_give_no(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند لغو کند.", show_alert=True)
+
+    data = await state.get_data()
+    token = callback.data[len("tgive_no_"):]
+    if not data or token != data.get("tgive_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    await state.clear()
+    await callback.message.edit_text("❌ انتقال از خزانه لغو شد.")
+
+
+# =====================================================================================
+# 🏛 دستور /treasury_take: انتقال مستقیم و یک‌باره از موجودی آزاد یک کاربر به خزانه مرکزی
+# =====================================================================================
+def _build_ttake_dialog(target: int, target_name: str, amount: int, target_transferable: int, treasury_balance: int, token: str):
+    """متن و کیبورد مرحله «تأیید اولیه» برای /treasury_take."""
+    safe_target_name = html.escape(target_name or "ناشناس")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید اولیه", callback_data=f"ttake_yes_{token}"),
+        InlineKeyboardButton(text="❌ لغو", callback_data=f"ttake_no_{token}"),
+    ]])
+    text = (
+        f"⚠️ <b>تأیید برداشت به خزانه مرکزی</b>\n\n"
+        f"👤 از حساب: <b>{safe_target_name}</b> (<code>{target}</code>)\n"
+        f"💰 مبلغ: <code>₳ {amount}</code>\n"
+        f"🔓 موجودی آزاد فعلی کاربر: <code>₳ {target_transferable}</code>\n"
+        f"🏛 موجودی فعلی خزانه: <code>₳ {treasury_balance}</code>\n\n"
+        f"آیا مطمئن هستید؟"
+    )
+    return text, kb
+
+
+def _build_ttake_final_dialog(target: int, amount: int, token: str):
+    """متن و کیبورد مرحله «تأیید نهایی» برای /treasury_take."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید نهایی", callback_data=f"ttake_final_yes_{token}"),
+        InlineKeyboardButton(text="❌ لغو", callback_data=f"ttake_final_no_{token}"),
+    ]])
+    text = (
+        f"⚠️ <b>تأیید نهایی</b>\n\n"
+        f"با تأیید نهایی، مبلغ <code>₳ {amount}</code> از حساب <code>{target}</code> به خزانه مرکزی منتقل خواهد شد.\n"
+        f"این عملیات قابل بازگشت نیست.\n\n"
+        f"آیا کاملاً مطمئن هستید؟"
+    )
+    return text, kb
+
+
+@admin_router.message(Command("treasury_take"))
+async def cmd_treasury_take(message: Message, state: FSMContext):
+    if not is_private(message):
+        return
+    if message.from_user.id != TREASURY_USER_ID:
+        return
+
+    text = message.text.strip()
+    if text.startswith("/treasury_take"):
+        text = text[len("/treasury_take"):].strip()
+
+    # حالت ریپلای روی پیام کاربر: فقط مبلغ لازم است
+    if message.reply_to_message and message.reply_to_message.from_user:
+        try:
+            amount = int(text)
+        except ValueError:
+            return await message.reply("❌ مبلغ وارد شده نامعتبر است.")
+        target = message.reply_to_message.from_user.id
+    else:
+        parts = text.split()
+        if len(parts) < 2:
+            return await message.reply(
+                "❌ ساختار: <code>/treasury_take [آیدی] [مبلغ]</code>\n"
+                "یا با ریپلای روی پیام کاربر: <code>/treasury_take [مبلغ]</code>",
+                parse_mode="HTML",
+            )
+        try:
+            target, amount = int(parts[0]), int(parts[1])
+        except ValueError:
+            return await message.reply("❌ آیدی و مبلغ باید عدد صحیح باشند.")
+
+    if amount <= 0 or amount > MAX_BALANCE_LIMIT:
+        return await message.reply("❌ مبلغ باید یک عدد صحیح مثبت و کمتر از سقف مجاز باشد.")
+    if target == TREASURY_USER_ID:
+        return await message.reply("❌ امکان انتقال از خزانه به خودش وجود ندارد.")
+
+    target_data = await get_user_data(target)
+    if not target_data:
+        return await message.reply("❌ کاربر مقصد یافت نشد.")
+
+    # 🔓 فقط موجودی آزاد (غیر از مبالغ فریزشده مثل وثیقه وام یا سفارش‌های در حال ارسال) قابل‌برداشت است
+    target_transferable = max(0, target_data["balance"] - target_data["frozen_balance"])
+    if target_transferable < amount:
+        return await message.reply(
+            f"❌ موجودی آزاد کاربر کافی نیست. موجودی آزاد فعلی: <code>₳ {target_transferable}</code>",
+            parse_mode="HTML",
+        )
+
+    treasury_balance = await get_treasury_balance()
+    if treasury_balance + amount > MAX_BALANCE_LIMIT:
+        return await message.reply("❌ خطا: سقف موجودی خزانه.")
+
+    # 🔐 شناسه یکتا برای جلوگیری از اجرای تکراری/کلیک روی دکمه‌های قدیمی
+    token = uuid.uuid4().hex[:12]
+    await state.update_data(
+        ttake_target=target, ttake_amount=amount, ttake_token=token,
+        ttake_target_name=target_data["full_name"],
+        ttake_target_transferable=target_transferable, ttake_treasury_balance=treasury_balance,
+    )
+
+    if target_data["is_frozen"]:
+        # ⚠️ مقصد فریز است: عملیات رد نمی‌شود، فقط قبل از ادامه هشدار داده می‌شود
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="➡️ ادامه", callback_data=f"ttake_frozen_yes_{token}"),
+            InlineKeyboardButton(text="❌ لغو", callback_data=f"ttake_frozen_no_{token}"),
+        ]])
+        confirm_msg = await message.reply(
+            _frozen_target_card_text(target_data, target), reply_markup=kb, parse_mode="HTML"
+        )
+        await state.set_state(TreasuryConfirmForm.waiting_for_frozen_ack)
+    else:
+        dtext, kb = _build_ttake_dialog(
+            target, target_data["full_name"], amount, target_transferable, treasury_balance, token
+        )
+        confirm_msg = await message.reply(dtext, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(TreasuryConfirmForm.waiting_for_confirm)
+
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
+    )
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_frozen_ack, F.data.startswith("ttake_frozen_yes_"))
+async def cb_treasury_take_frozen_yes(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند ادامه دهد.", show_alert=True)
+    data = await state.get_data()
+    token = callback.data[len("ttake_frozen_yes_"):]
+    if not data or token != data.get("ttake_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    text, kb = _build_ttake_dialog(
+        data["ttake_target"], data.get("ttake_target_name"), data["ttake_amount"],
+        data["ttake_target_transferable"], data["ttake_treasury_balance"], token
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await state.set_state(TreasuryConfirmForm.waiting_for_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, callback.from_user.id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_frozen_ack, F.data.startswith("ttake_frozen_no_"))
+async def cb_treasury_take_frozen_no(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند لغو کند.", show_alert=True)
+    data = await state.get_data()
+    token = callback.data[len("ttake_frozen_no_"):]
+    if not data or token != data.get("ttake_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    await state.clear()
+    await callback.message.edit_text("❌ برداشت به خزانه لغو شد.")
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data.startswith("ttake_yes_"))
+async def cb_treasury_take_yes(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند تأیید کند.", show_alert=True)
+
+    data = await state.get_data()
+    token = callback.data[len("ttake_yes_"):]
+    if not data or token != data.get("ttake_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+
+    # ⚠️ طبق فلوی جدید، پس از «تأیید اولیه» باید «تأیید نهایی» نمایش داده شود؛ اجرا فقط بعد از آن است
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    text, kb = _build_ttake_final_dialog(data["ttake_target"], data["ttake_amount"], token)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, callback.from_user.id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data.startswith("ttake_final_yes_"))
+async def cb_treasury_take_final_yes(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند تأیید کند.", show_alert=True)
+
+    data = await state.get_data()
+    token = callback.data[len("ttake_final_yes_"):]
+    if not data or token != data.get("ttake_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    await state.clear()
+
+    target = data["ttake_target"]
+    amount = data["ttake_amount"]
+
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT balance, frozen_balance FROM users WHERE user_id = ?", (target,)
+            ) as cur_u:
+                target_row = await cur_u.fetchone()
+
+            target_transferable = max(0, target_row["balance"] - target_row["frozen_balance"]) if target_row else 0
+            treasury_balance = await get_treasury_balance()
+
+            if not target_row or target_transferable < amount or treasury_balance + amount > MAX_BALANCE_LIMIT:
+                await db.rollback()
+                return await callback.message.edit_text("❌ خطا در وضعیت حساب؛ تراکنش لغو شد.")
+
+            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, target))
+            # 🏛 واریز به خزانه (با ثبت خودکار یک ردیف audit_log توسط همین تابع)
+            await treasury_credit(
+                db, amount, f"[TREASURY_TAKE] انتقال مستقیم از کاربر {target} به خزانه", related_user=target
+            )
+            await db.commit()
+
+    await callback.message.edit_text(
+        f"✅ مبلغ <code>₳ {amount}</code> از حساب <code>{target}</code> به خزانه مرکزی منتقل شد.",
+        parse_mode="HTML",
+    )
+    try:
+        await callback.bot.send_message(
+            target,
+            f"🏛 مبلغ <code>₳ {amount}</code> از حساب شما به خزانه مرکزی آترامنتوم منتقل شد.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data.startswith("ttake_final_no_"))
+async def cb_treasury_take_final_no(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند لغو کند.", show_alert=True)
+    data = await state.get_data()
+    token = callback.data[len("ttake_final_no_"):]
+    if not data or token != data.get("ttake_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    await state.clear()
+    await callback.message.edit_text("❌ برداشت به خزانه لغو شد.")
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data.startswith("ttake_no_"))
+async def cb_treasury_take_no(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != TREASURY_USER_ID:
+        return await callback.answer("❌ فقط حساب خزانه مرکزی می‌تواند لغو کند.", show_alert=True)
+
+    data = await state.get_data()
+    token = callback.data[len("ttake_no_"):]
+    if not data or token != data.get("ttake_token"):
+        return await callback.answer("❌ این دکمه دیگر معتبر نیست.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    await state.clear()
+    await callback.message.edit_text("❌ برداشت به خزانه لغو شد.")
+
+
+# =====================================================================================
+# 🏛 دستور /group_salary: واریز اتمیک حقوق گروهی از خزانه به اعضای یک گروه
+# (با فلوی کامل هشدار فریز ⬅️ تأیید اولیه ⬅️ تأیید نهایی ⬅️ اجرا، تماماً با Edit همان پیام)
+# =====================================================================================
+@admin_router.message(Command("group_salary"))
+async def cmd_group_salary(message: Message, state: FSMContext):
+    if not is_private(message):
+        return
+    if message.from_user.id != TREASURY_USER_ID:
+        return
+
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        return await message.reply(
+            "❌ ساختار: <code>/group_salary [گروه] [مبلغ_هر_نفر]</code>", parse_mode="HTML"
+        )
+
+    g_name = args[1]
+    try:
+        per_person = int(args[2])
+    except ValueError:
+        return await message.reply("❌ مبلغ هر نفر باید عدد صحیح باشد.")
+    if per_person <= 0 or per_person > MAX_BALANCE_LIMIT:
+        return await message.reply("❌ مبلغ هر نفر باید یک عدد صحیح مثبت و کمتر از سقف مجاز باشد.")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        # 🏛 خزانه همیشه از دریافت‌کنندگان حذف است، حتی اگر گروهش با گروه هدف یکی باشد
+        async with db.execute(
+            "SELECT user_id, full_name, username, balance, is_frozen FROM users WHERE group_name = ? AND user_id != ?",
+            (g_name, TREASURY_USER_ID),
+        ) as cur:
+            all_members = await cur.fetchall()
+
+    if not all_members:
+        return await message.reply("❌ هیچ عضوی در این گروه یافت نشد.")
+
+    normal_members = [m for m in all_members if not m["is_frozen"]]
+    frozen_members = [m for m in all_members if m["is_frozen"]]
+
+    await state.update_data(
+        action="group_salary",
+        gop_group=g_name,
+        gop_amount=per_person,
+        gop_normal_members=normal_members,
+        gop_frozen_members=frozen_members,
+        admin_id=message.from_user.id,
+    )
+
+    if frozen_members:
+        text, kb = _group_frozen_warning_page(len(normal_members), frozen_members, 0, g_name, per_person)
+        confirm_msg = await message.reply(text, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(TreasuryConfirmForm.waiting_for_frozen_ack)
+    else:
+        text, kb = _build_group_path_dialog("group_salary", g_name, per_person, len(normal_members), 0, False)
+        confirm_msg = await message.reply(text, reply_markup=kb, parse_mode="HTML")
+        await state.set_state(TreasuryConfirmForm.waiting_for_confirm)
+
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
+    )
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data == "gsalary_yes")
+async def cb_group_salary_yes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید تأیید کنید.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    g_name = data["gop_group"]
+    amount = data["gop_amount"]
+    include_frozen = data.get("gop_include_frozen", False)
+    normal_count = len(data["gop_normal_members"])
+    frozen_count = len(data["gop_frozen_members"]) if include_frozen else 0
+    recipient_count = normal_count + frozen_count
+    total = recipient_count * amount
+    safe_g_name = html.escape(g_name)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید نهایی", callback_data="gsalary_final_yes"),
+        InlineKeyboardButton(text="❌ لغو", callback_data="gsalary_final_no"),
+    ]])
+    try:
+        await callback.message.edit_text(
+            f"⚠️ <b>تأیید نهایی</b>\n\n"
+            f"با تأیید نهایی، مبلغ <code>₳ {amount}</code> به <code>{recipient_count}</code> نفر از گروه «<b>{safe_g_name}</b>» "
+            f"(مجموعاً <code>₳ {total}</code>) از خزانه مرکزی واریز خواهد شد.\n"
+            f"این عملیات قابل بازگشت نیست.\n\n"
+            f"آیا کاملاً مطمئن هستید؟",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, admin_id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data == "gsalary_no")
+async def cb_group_salary_no(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید لغو کنید.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    await state.clear()
+    await callback.message.edit_text("❌ عملیات لغو شد.")
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data == "gsalary_final_yes")
+async def cb_group_salary_final_yes(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید تأیید کنید.", show_alert=True)
+
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    await state.clear()
+
+    g_name = data["gop_group"]
+    per_person = data["gop_amount"]
+    include_frozen = data.get("gop_include_frozen", False)
+    normal_members = data["gop_normal_members"]
+    frozen_members = data["gop_frozen_members"] if include_frozen else []
+    members = list(normal_members) + list(frozen_members)
+    ids = [m["user_id"] for m in members]
+
+    if not ids:
+        return await callback.message.edit_text("❌ هیچ عضوی برای پرداخت یافت نشد.")
+
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            # 🔄 بازخوانی تازه موجودی اعضا و خزانه بلافاصله قبل از اجرا (محافظت در برابر race condition)
+            placeholders = ",".join("?" for _ in ids)
+            async with db.execute(
+                f"SELECT user_id, balance FROM users WHERE user_id IN ({placeholders})", ids
+            ) as cur:
+                fresh_members = await cur.fetchall()
+
+            total = len(fresh_members) * per_person
+
+            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (TREASURY_USER_ID,)) as cur_t:
+                treasury_row = await cur_t.fetchone()
+            treasury_balance = treasury_row["balance"] if treasury_row else 0
+
+            if treasury_balance < total:
+                await db.rollback()
+                return await callback.message.edit_text("❌ موجودی خزانه کافی نیست؛ عملیات لغو شد.")
+
+            over_cap = [m for m in fresh_members if m["balance"] + per_person > MAX_BALANCE_LIMIT]
+            if over_cap:
+                await db.rollback()
+                return await callback.message.edit_text(
+                    f"❌ عملیات لغو شد: موجودی {len(over_cap)} نفر از اعضا از سقف مجاز عبور می‌کند."
+                )
+
+            # 🏛 کسر یک‌باره کل مبلغ از خزانه (بدون لاگ کلی؛ لاگ‌ها جداگانه و به ازای هر عضو ثبت می‌شوند)
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE user_id = ?", (total, TREASURY_USER_ID)
+            )
+
+            batch_id = f"GS-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6]}"
+            ts = datetime.now(timezone.utc).isoformat()
+            for idx, m in enumerate(fresh_members, start=1):
+                await db.execute(
+                    "UPDATE users SET balance = balance + ? WHERE user_id = ?", (per_person, m["user_id"])
+                )
+                await db.execute(
+                    "INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        f"{batch_id}-{idx}", ts, TREASURY_USER_ID, m["user_id"], per_person,
+                        f"[GROUP_SALARY] batch_id={batch_id} گروه={g_name}",
+                    ),
+                )
+
+            await db.commit()
+
+    safe_g_name = html.escape(g_name)
+    await callback.message.edit_text(
+        f"✅ حقوق گروهی برای <code>{len(fresh_members)}</code> نفر از گروه «<b>{safe_g_name}</b>» با موفقیت واریز شد.\n"
+        f"💰 مبلغ هر نفر: <code>₳ {per_person}</code> | مبلغ کل: <code>₳ {total}</code>",
+        parse_mode="HTML",
+    )
+
+
+@admin_router.callback_query(TreasuryConfirmForm.waiting_for_confirm, F.data == "gsalary_final_no")
+async def cb_group_salary_final_no(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("admin_id")
+    if callback.from_user.id != admin_id:
+        return await callback.answer("❌ فقط خودتان می‌توانید لغو کنید.", show_alert=True)
+    cancel_input_timeout(callback.message.chat.id, admin_id)
+    await state.clear()
+    await callback.message.edit_text("❌ عملیات لغو شد.")
+
+
 @admin_router.message(Command("promote"))
-async def cmd_promote(message: Message):
+async def cmd_promote(message: Message, state: FSMContext):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("استفاده: <code>/promote [آیدی]</code>", parse_mode="HTML")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_admin = 1 WHERE user_id = ?",
-            (int(args[1]),),
-        )
-        await db.commit()
-    await message.reply("👑 کاربر به سطح ادمین ارتقا یافت.")
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ آیدی باید عدد باشد.")
+    preview_text = (
+        "🎖 <b>تأیید ارتقا به ادمین</b>\n"
+        f"آیا از اعطای اختیارات ادمینی به کاربر {target_id} اطمینان دارید؟"
+    )
+    await _start_ops_confirmation(message, state, "promote", preview_text, op_user_id=target_id)
 
 
 @admin_router.message(Command("demote"))
-async def cmd_demote(message: Message):
+async def cmd_demote(message: Message, state: FSMContext):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("استفاده: <code>/demote [آیدی]</code>", parse_mode="HTML")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_admin = 0 WHERE user_id = ?",
-            (int(args[1]),),
-        )
-        await db.commit()
-    await message.reply("🔥 دسترسی ادمینی کاربر سلب شد.")
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ آیدی باید عدد باشد.")
+    preview_text = (
+        "🔻 <b>تأیید سلب مقام ادمین</b>\n"
+        f"آیا از حذف دسترسی‌های ادمینی کاربر {target_id} مطمئن هستید؟"
+    )
+    await _start_ops_confirmation(message, state, "demote", preview_text, op_user_id=target_id)
 
 
 @admin_router.message(Command("list_admins"))
@@ -1845,7 +3798,7 @@ async def cmd_list_admins(message: Message):
 
 
 @admin_router.message(Command("add_super"))
-async def cmd_add_super(message: Message):
+async def cmd_add_super(message: Message, state: FSMContext):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
     args = message.text.split()
@@ -1859,24 +3812,15 @@ async def cmd_add_super(message: Message):
     if new_id in SUPER_ADMINS:
         return await message.reply("ℹ️ این کاربر از قبل سوپرادمین است.")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO super_admins (user_id) VALUES (?)", (new_id,)
-        )
-        await db.commit()
-        await load_super_admins(db)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_admin = 1 WHERE user_id = ?", (new_id,)
-        )
-        await db.commit()
-
-    await message.reply(f"✅ کاربر <code>{new_id}</code> به سوپرادمین‌ها اضافه شد.", parse_mode="HTML")
+    preview_text = (
+        "👑 <b>هشدار حساس: اعطای دسترسی سوپرادمین</b>\n"
+        f"آیا از افزودن کاربر {new_id} به لیست سوپرادمین‌ها (دسترسی کامل به خزانه و تنظیمات) مطمئن هستید؟"
+    )
+    await _start_ops_confirmation(message, state, "add_super", preview_text, op_user_id=new_id)
 
 
 @admin_router.message(Command("remove_super"))
-async def cmd_remove_super(message: Message):
+async def cmd_remove_super(message: Message, state: FSMContext):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
     args = message.text.split()
@@ -1893,42 +3837,47 @@ async def cmd_remove_super(message: Message):
     if rem_id not in SUPER_ADMINS:
         return await message.reply("ℹ️ این کاربر سوپرادمین نیست.")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM super_admins WHERE user_id = ?", (rem_id,))
-        await db.commit()
-        await load_super_admins(db)
-
-    await message.reply(f"✅ کاربر <code>{rem_id}</code> از سوپرادمین‌ها حذف شد.", parse_mode="HTML")
+    preview_text = (
+        "⚠️ <b>تأیید عزل سوپرادمین</b>\n"
+        f"آیا از سلب دسترسی سوپرادمین از کاربر {rem_id} اطمینان دارید؟"
+    )
+    await _start_ops_confirmation(message, state, "remove_super", preview_text, op_user_id=rem_id)
 
 
 @admin_router.message(Command("freeze"))
-async def cmd_freeze(message: Message):
+async def cmd_freeze(message: Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return await message.reply("❌ این دستور فقط مخصوص سوپرادمین است.")
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("استفاده: <code>/freeze [آیدی]</code>", parse_mode="HTML")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_frozen = 1 WHERE user_id = ?", (int(args[1]),)
-        )
-        await db.commit()
-    await message.reply("❄️ حساب کاربر فریز شد.")
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ آیدی باید عدد باشد.")
+    preview_text = (
+        "❄️ <b>هشدار مسدودسازی حساب</b>\n"
+        f"آیا از فریز و مسدود کردن تمام فعالیت‌های کاربر {target_id} اطمینان دارید؟"
+    )
+    await _start_ops_confirmation(message, state, "freeze", preview_text, op_user_id=target_id)
 
 
 @admin_router.message(Command("unfreeze"))
-async def cmd_unfreeze(message: Message):
+async def cmd_unfreeze(message: Message, state: FSMContext):
     if not is_super_admin(message.from_user.id):
         return await message.reply("❌ این دستور فقط مخصوص سوپرادمین است.")
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("استفاده: <code>/unfreeze [آیدی]</code>", parse_mode="HTML")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_frozen = 0 WHERE user_id = ?", (int(args[1]),)
-        )
-        await db.commit()
-    await message.reply("🟢 حساب کاربر فعال شد.")
+    try:
+        target_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ آیدی باید عدد باشد.")
+    preview_text = (
+        "🟢 <b>تأیید فعال‌سازی حساب</b>\n"
+        f"آیا از خروج حساب کاربر {target_id} از حالت فریز اطمینان دارید؟"
+    )
+    await _start_ops_confirmation(message, state, "unfreeze", preview_text, op_user_id=target_id)
 
 
 @admin_router.message(Command("check"))
@@ -1979,14 +3928,22 @@ async def cmd_reset_all(message: Message, state: FSMContext):
             InlineKeyboardButton(text="❌ انصراف", callback_data="reset_no"),
         ]]
     )
-    await message.reply(
+    confirm_msg = await message.reply(
         "⚠️ <b>هشدار بسیار مهم!</b>\n\n"
-        "آیا مطمئن هستید؟ این دستور تمام داده‌ها، کاربران، گروه‌ها و تراکنش‌ها را <b>حذف کاملاً دائم</b> می‌کند و دیتابیس صفر خواهد شد.\n\n"
+        "آیا مطمئن هستید؟ این دستور یک <b>ریست کامل سیستم</b> انجام می‌دهد: تمام کاربران، موجودی کیف پول‌ها، "
+        "موجودی بانک‌ها، موجودی خزانه مرکزی، موجودی فروشگاه‌ها، وثیقه‌های قفل‌شده، وام‌ها، سفارش‌ها، محصولات، "
+        "تراکنش‌ها، تاریخچه‌ها و کلیه داده‌های مالی و وابسته <b>حذف کاملاً دائم</b> می‌شوند.\n\n"
+        "⚙️ تنها بخشی که حذف <b>نخواهد</b> شد، تنظیمات مدیریتی و درصدهای موجود در <code>/view_set_all</code> است.\n\n"
         "آیا قصد ادامه دارید؟",
         reply_markup=kb,
         parse_mode="HTML"
     )
     await state.set_state(ResetForm.waiting_for_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, confirm_msg.message_id),
+    )
 
 
 @admin_router.callback_query(ResetForm.waiting_for_confirm, F.data == "reset_yes")
@@ -1994,23 +3951,66 @@ async def cb_reset_yes(callback: CallbackQuery, state: FSMContext):
     if not is_super_admin(callback.from_user.id):
         return await callback.answer("❌ عدم دسترسی.", show_alert=True)
 
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
     await state.clear()
-    await callback.message.edit_text("⏳ در حال حذف دیتابیس و ری‌ست کردن سیستم...")
+    await callback.message.edit_text("⏳ در حال ریست کامل سیستم (به‌جز تنظیمات مدیریتی)...")
 
-    async with db_lock:
-        if os.path.exists(DB_PATH):
-            try:
-                os.remove(DB_PATH)
-            except Exception as e:
-                return await callback.message.edit_text(f"❌ خطا در حذف فایل دیتابیس: {e}")
+    # ⚠️ توجه: به‌جای حذف کامل فایل دیتابیس، فقط جدول‌های داده‌ای/مالی/کاربری پاک می‌شوند
+    # تا جدول system_settings (تمام درصدها و تنظیمات قابل مشاهده در /view_set_all) و جدول
+    # super_admins (دسترسی‌های مدیریتی) دست‌نخورده باقی بمانند.
+    tables_to_wipe = [
+        "users",           # تمام کاربران + موجودی کیف پول + موجودی بانک + وثیقه‌ها (ستون‌های همین جدول)
+        "audit_logs",      # تراکنش‌ها و تاریخچه‌ها
+        "group_links",     # لینک‌های گروه
+        "groups",          # گروه‌ها
+        "shops",           # فروشگاه‌ها
+        "products",        # محصولات
+        "couriers",        # پستچی‌ها
+        "orders",          # سفارش‌ها
+        "loans",           # وام‌ها
+        "loan_installments",  # اقساط وام‌ها
+    ]
 
-        await init_db()
+    try:
+        async with db_lock:
+            async with aiosqlite.connect(DB_PATH) as db:
+                for table in tables_to_wipe:
+                    await db.execute(f"DELETE FROM {table}")
+                # ریست شمارنده‌های AUTOINCREMENT برای شروع تمیز شناسه‌ها (بدون تأثیر روی تنظیمات)
+                try:
+                    await db.execute(
+                        "DELETE FROM sqlite_sequence WHERE name IN "
+                        "('shops','products','orders','loans','loan_installments')"
+                    )
+                except Exception:
+                    pass
+                # بازسازی گروه پیش‌فرض
+                await db.execute("INSERT OR IGNORE INTO groups (group_name) VALUES ('Default')")
+                # بازسازی حساب خزانه مرکزی با موجودی صفر
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO users (user_id, username, full_name, balance)
+                    VALUES (?, ?, ?, 0)
+                    """,
+                    (TREASURY_USER_ID, "Treasury", "🏛 خزانه مرکزی آترامنتوم"),
+                )
+                await db.commit()
+                await load_super_admins(db)
+    except Exception as e:
+        return await callback.message.edit_text(f"❌ خطا در ریست کردن سیستم: {e}")
 
-    await callback.message.edit_text("💥 <b>دیتابیس با موفقیت صفر شد و ربات ری‌ست گردید!</b>", parse_mode="HTML")
+    await callback.message.edit_text(
+        "💥 <b>سیستم با موفقیت ریست کامل شد!</b>\n\n"
+        "✅ تمام کاربران، موجودی‌ها، بانک، خزانه، فروشگاه‌ها، وثیقه‌ها، وام‌ها، سفارش‌ها، محصولات، "
+        "تراکنش‌ها و تاریخچه‌ها حذف شدند.\n"
+        "⚙️ تنظیمات مدیریتی و درصدهای سیستم (<code>/view_set_all</code>) دست‌نخورده باقی ماندند.",
+        parse_mode="HTML",
+    )
 
 
 @admin_router.callback_query(ResetForm.waiting_for_confirm, F.data == "reset_no")
 async def cb_reset_no(callback: CallbackQuery, state: FSMContext):
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
     await state.clear()
     await callback.message.edit_text("❌ عملیات صفر کردن دیتابیس لغو شد.")
 
@@ -2099,6 +4099,30 @@ async def cmd_restore(message: Message):
 
 # --- ۱. دستورات سوپرادمین برای تنظیم نرخ‌ها و مدیریت نقش‌ها ---
 
+LIST_SHOPS_PAGE_SIZE = 10
+
+
+def _render_list_shops_page(shops, page: int):
+    total = len(shops)
+    total_pages = max(1, math.ceil(total / LIST_SHOPS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * LIST_SHOPS_PAGE_SIZE
+    page_items = shops[start:start + LIST_SHOPS_PAGE_SIZE]
+
+    txt = f"🏪 <b>لیست فروشگاه‌های سیستم (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"مجموع فروشگاه‌ها: <code>{total}</code> فروشگاه\n\n"
+    for s in page_items:
+        safe_title = html.escape(s["channel_title"] or "بدون نام")
+        st_text = "✅ فعال" if s["status"] == "APPROVED" else "⏳ در انتظار تایید"
+        txt += (
+            f"🔹 <b>{safe_title}</b> (شناسه: <code>{s['shop_id']}</code>) | "
+            f"مالک: <code>{s['owner_id']}</code> | وضعیت: {st_text}\n"
+        )
+
+    kb = _build_pagination_keyboard(page, total_pages, "listshops_page", refresh_data="listshops_refresh")
+    return txt, kb
+
+
 @admin_router.message(Command("list_shops"))
 async def cmd_list_shops(message: Message):
     """دستور جدید 1: مشاهده لیست کامل فروشگاه‌ها"""
@@ -2113,22 +4137,64 @@ async def cmd_list_shops(message: Message):
     if not shops:
         return await message.reply("ℹ️ هیچ فروشگاهی در دیتابیس ثبت نشده است.")
 
-    txt = f"🏪 <b>لیست فروشگاه‌های ثبت‌شده</b> (<code>{len(shops)}</code> فروشگاه):\n\n"
-    for idx, s in enumerate(shops, start=1):
-        safe_title = html.escape(s['channel_title'] or 'بدون نام')
-        safe_ch_id = html.escape(str(s['channel_id']))
-        st_text = "✅ تایید شده" if s['status'] == "APPROVED" else "⏳ در انتظار تایید"
-        
-        txt += (
-            f"<b>{idx}. {safe_title}</b>\n"
-            f"🆔 شناسه فروشگاه: <code>{s['shop_id']}</code>\n"
-            f"👤 آیدی صاحب شاپ: <code>{s['owner_id']}</code>\n"
-            f"📢 کانال/گروه: <code>{safe_ch_id}</code>\n"
-            f"⚡ وضعیت: {st_text}\n"
-            f"------------------------------\n"
-        )
-        
-    await message.reply(txt, parse_mode="HTML")
+    txt, kb = _render_list_shops_page(shops, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data == "listshops_page_noop")
+async def cb_list_shops_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+async def _list_shops_reload(callback: CallbackQuery, page: int):
+    if not await check_admin_filter(callback):
+        return await callback.answer("عدم دسترسی.", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT shop_id, owner_id, channel_id, channel_title, status FROM shops") as cur:
+            shops = await cur.fetchall()
+    if not shops:
+        return await callback.answer("ℹ️ هیچ فروشگاهی در دیتابیس ثبت نشده است.", show_alert=True)
+    txt, kb = _render_list_shops_page(shops, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@admin_router.callback_query(F.data.startswith("listshops_page_"))
+async def cb_list_shops_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    await _list_shops_reload(callback, page)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "listshops_refresh")
+async def cb_list_shops_refresh(callback: CallbackQuery):
+    page = _extract_current_page(callback.message.text or "")
+    await _list_shops_reload(callback, page)
+    await callback.answer("🔄 لیست به‌روزرسانی شد.")
+
+
+
+LIST_COURIERS_PAGE_SIZE = 10
+
+
+def _render_list_couriers_page(couriers, page: int):
+    total = len(couriers)
+    total_pages = max(1, math.ceil(total / LIST_COURIERS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * LIST_COURIERS_PAGE_SIZE
+    page_items = couriers[start:start + LIST_COURIERS_PAGE_SIZE]
+
+    txt = f"🚚 <b>لیست پستچی‌های فعال (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"تعداد پستچی‌ها: <code>{total}</code> نفر\n\n"
+    for c in page_items:
+        safe_name = html.escape(c["full_name"] or "ناشناس")
+        txt += f"🔹 <b>{safe_name}</b> | <code>{c['user_id']}</code> | دسترسی: 🟢 فعال\n"
+
+    kb = _build_pagination_keyboard(page, total_pages, "listcouriers_page", refresh_data="listcouriers_refresh")
+    return txt, kb
 
 
 @admin_router.message(Command("list_couriers"))
@@ -2147,18 +4213,46 @@ async def cmd_list_couriers(message: Message):
     if not couriers:
         return await message.reply("ℹ️ هیچ پستچی در سیستم ثبت نشده است.")
 
-    txt = f"🚚 <b>لیست پستچی‌های فعال</b> (<code>{len(couriers)}</code> نفر):\n\n"
-    for idx, c in enumerate(couriers, start=1):
-        safe_name = html.escape(c['full_name'] or 'ناشناس')
-        safe_uname = f"@{html.escape(c['username'])}" if c['username'] and c['username'] != "بدون آیدی" else "بدون یوزرنیم"
-        
-        txt += (
-            f"<b>{idx}. {safe_name}</b> ({safe_uname})\n"
-            f"🆔 آیدی عددی: <code>{c['user_id']}</code>\n"
-            f"------------------------------\n"
-        )
+    txt, kb = _render_list_couriers_page(couriers, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
 
-    await message.reply(txt, parse_mode="HTML")
+
+@admin_router.callback_query(F.data == "listcouriers_page_noop")
+async def cb_list_couriers_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+async def _list_couriers_reload(callback: CallbackQuery, page: int):
+    if not await check_admin_filter(callback):
+        return await callback.answer("عدم دسترسی.", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT c.user_id, u.full_name, u.username FROM couriers c LEFT JOIN users u ON c.user_id = u.user_id"
+        ) as cur:
+            couriers = await cur.fetchall()
+    if not couriers:
+        return await callback.answer("ℹ️ هیچ پستچی در سیستم ثبت نشده است.", show_alert=True)
+    txt, kb = _render_list_couriers_page(couriers, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@admin_router.callback_query(F.data.startswith("listcouriers_page_"))
+async def cb_list_couriers_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    await _list_couriers_reload(callback, page)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "listcouriers_refresh")
+async def cb_list_couriers_refresh(callback: CallbackQuery):
+    page = _extract_current_page(callback.message.text or "")
+    await _list_couriers_reload(callback, page)
+    await callback.answer("🔄 لیست به‌روزرسانی شد.")
+
 
 
 @admin_router.message(Command("set_shop_rates"))
@@ -2334,6 +4428,62 @@ async def cmd_set_collateral_rate(message: Message):
     await message.reply(f"✅ نرخ وثیقه وام به <b>{rate * 100:.1f}٪</b> تغییر یافت.", parse_mode="HTML")
 
 
+@admin_router.message(Command("set_loan_guarantor_balance_rate"))
+async def cmd_set_loan_guarantor_balance_rate(message: Message):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        return await message.reply(
+            "راهنما: <code>/set_loan_guarantor_balance_rate [نرخ_گیرنده] [نرخ_ضامن]</code>\n"
+            "مثال (۲۰٪ و ۲۰٪): <code>/set_loan_guarantor_balance_rate 0.20 0.20</code>",
+            parse_mode="HTML"
+        )
+    try:
+        rate_borrower = float(args[1])
+        rate_guarantor = float(args[2])
+        if not (0 < rate_borrower <= 1) or not (0 < rate_guarantor <= 1):
+            raise ValueError
+    except ValueError:
+        return await message.reply("❌ هر دو مقدار باید بین 0 و 1 باشند (مثال: 0.20).")
+    await set_setting("loan_guarantor_balance_rate_borrower", rate_borrower)
+    await set_setting("loan_guarantor_balance_rate_guarantor", rate_guarantor)
+    await message.reply(
+        f"✅ نرخ موجودی وام ضامنی تغییر یافت.\n"
+        f"👤 نرخ گیرنده: <b>{rate_borrower * 100:.1f}٪</b>\n"
+        f"🤝 نرخ ضامن: <b>{rate_guarantor * 100:.1f}٪</b>",
+        parse_mode="HTML",
+    )
+
+
+@admin_router.message(Command("set_loan_guarantor_collateral_rate"))
+async def cmd_set_loan_guarantor_collateral_rate(message: Message):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) < 3:
+        return await message.reply(
+            "راهنما: <code>/set_loan_guarantor_collateral_rate [نرخ_گیرنده] [نرخ_ضامن]</code>\n"
+            "مثال (۸٪ و ۹٪): <code>/set_loan_guarantor_collateral_rate 0.08 0.09</code>",
+            parse_mode="HTML"
+        )
+    try:
+        rate_borrower = float(args[1])
+        rate_guarantor = float(args[2])
+        if not (0 < rate_borrower <= 1) or not (0 < rate_guarantor <= 1):
+            raise ValueError
+    except ValueError:
+        return await message.reply("❌ هر دو مقدار باید بین 0 و 1 باشند (مثال: 0.08).")
+    await set_setting("loan_guarantor_collateral_rate_borrower", rate_borrower)
+    await set_setting("loan_guarantor_collateral_rate_guarantor", rate_guarantor)
+    await message.reply(
+        f"✅ نرخ وثیقه وام ضامنی تغییر یافت.\n"
+        f"👤 نرخ گیرنده: <b>{rate_borrower * 100:.1f}٪</b>\n"
+        f"🤝 نرخ ضامن: <b>{rate_guarantor * 100:.1f}٪</b>",
+        parse_mode="HTML",
+    )
+
+
 @admin_router.message(Command("set_req_balance_rate"))
 async def cmd_set_req_balance_rate(message: Message):
     if not is_private(message) or not is_super_admin(message.from_user.id):
@@ -2374,32 +4524,198 @@ async def cmd_set_late_penalty_rate(message: Message):
     await message.reply(f"✅ نرخ جریمه دیرکرد روزانه به <b>{rate * 100:.2f}٪</b> تغییر یافت.", parse_mode="HTML")
 
 
+@admin_router.message(Command("view_set_all"))
+async def cmd_view_set_all(message: Message):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
+
+    keys = [
+        "shop_seller_pct", "shop_bank_pct", "shop_burn_pct",
+        "courier_pct", "courier_bank_pct", "courier_burn_pct",
+        "tier1_pct", "tier2_pct", "tier3_pct",
+        "bank_daily_rate",
+        "min_loan_amount", "max_loan_amount",
+        "min_loan_interest", "max_loan_interest",
+        "allowed_installments",
+        "collateral_rate", "required_balance_rate", "late_penalty_rate",
+        "loan_guarantor_balance_rate_borrower", "loan_guarantor_balance_rate_guarantor",
+        "loan_guarantor_collateral_rate_borrower", "loan_guarantor_collateral_rate_guarantor",
+    ]
+    vals = {k: await get_setting(k) for k in keys}
+
+    def pct(key):
+        try:
+            return f"{float(vals[key])}"
+        except (TypeError, ValueError):
+            return str(vals[key])
+
+    def ratio_pct(key):
+        try:
+            return f"{float(vals[key]) * 100:.2f}"
+        except (TypeError, ValueError):
+            return str(vals[key])
+
+    txt = (
+        "⚙️ <b>تمام تنظیمات و درصدهای سیستم</b>\n"
+        "برای هر مورد: نام، مقدار فعلی، بخش مربوطه، کاربرد و دستور تنظیم آورده شده است.\n\n"
+
+        "🏪 <b>بخش: فروشگاه — درصد مالیات فروشگاه</b>\n"
+        f"🔸 سهم فروشنده: <code>{pct('shop_seller_pct')}٪</code>\n"
+        f"🔸 سهم بانک: <code>{pct('shop_bank_pct')}٪</code>\n"
+        f"🔸 سوخت (مالیات فروشگاه): <code>{pct('shop_burn_pct')}٪</code>\n"
+        "📝 کاربرد: تقسیم مبلغ هر فروش موفق فروشگاهی بین فروشنده، بانک و سوخت سیستم.\n"
+        "⚙️ تنظیم: <code>/set_shop_rates [فروشنده] [بانک] [سوخت]</code>\n\n"
+
+        "🚚 <b>بخش: پست — درصد سهم بانک و درصدهای/بازه‌های پستی</b>\n"
+        f"🔸 سهم پستچی: <code>{pct('courier_pct')}٪</code>\n"
+        f"🔸 سهم بانک از هزینه پست: <code>{pct('courier_bank_pct')}٪</code>\n"
+        f"🔸 سوخت هزینه پست: <code>{pct('courier_burn_pct')}٪</code>\n"
+        f"🔸 بازه هزینه پست (تا ۹۹ آتر): <code>{pct('tier1_pct')}٪</code>\n"
+        f"🔸 بازه هزینه پست (۱۰۰ تا ۹۹۹ آتر): <code>{pct('tier2_pct')}٪</code>\n"
+        f"🔸 بازه هزینه پست (۱۰۰۰ آتر به بالا): <code>{pct('tier3_pct')}٪</code>\n"
+        "📝 کاربرد: تقسیم هزینه پست بین پستچی، بانک و سوخت؛ و تعیین درصد هزینه پست بر اساس بازه قیمت محصول.\n"
+        "⚙️ تنظیم: <code>/set_courier_rates [پستچی] [بانک] [سوخت] [بازه۱] [بازه۲] [بازه۳]</code>\n\n"
+
+        "🏦 <b>بخش: بانک آترامنتوم — نرخ سود بانک</b>\n"
+        f"🔸 نرخ سود روزانه: <code>{pct('bank_daily_rate')}٪</code>\n"
+        "📝 کاربرد: نرخ سود روزانه‌ای که به سپرده‌های بانکی کاربران تعلق می‌گیرد.\n"
+        "⚙️ تنظیم: <code>/set_bank_rate [درصد]</code>\n\n"
+
+        "💳 <b>بخش: وام — حداقل/حداکثر مبلغ وام</b>\n"
+        f"🔸 حداقل مبلغ وام: <code>₳ {int(float(vals['min_loan_amount']))}</code>\n"
+        f"🔸 حداکثر مبلغ وام: <code>₳ {int(float(vals['max_loan_amount']))}</code>\n"
+        "📝 کاربرد: محدوده مبلغی که کاربران می‌توانند برای وام درخواست دهند.\n"
+        "⚙️ تنظیم: <code>/set_min_loan [مبلغ]</code> و <code>/set_max_loan [مبلغ]</code>\n\n"
+
+        "📈 <b>بخش: وام — حداقل/حداکثر سود وام</b>\n"
+        f"🔸 حداقل سود: <code>{pct('min_loan_interest')}٪</code>\n"
+        f"🔸 حداکثر سود: <code>{pct('max_loan_interest')}٪</code>\n"
+        "📝 کاربرد: نرخ سود وام به‌صورت پویا و متناسب با مبلغ وام، بین این دو مقدار محاسبه می‌شود.\n"
+        "⚙️ تنظیم: <code>/set_loan_interest [حداقل] [حداکثر]</code>\n\n"
+
+        "🔢 <b>بخش: وام — اقساط مجاز</b>\n"
+        f"🔸 تعداد اقساط مجاز: <code>{vals['allowed_installments']}</code>\n"
+        "📝 کاربرد: گزینه‌های تعداد قسطی که کاربر هنگام درخواست وام می‌تواند از بین آن‌ها انتخاب کند.\n"
+        "⚙️ تنظیم: <code>/set_loan_installments [لیست با کاما]</code>\n\n"
+
+        "🔒 <b>بخش: وام — نرخ وثیقه</b>\n"
+        f"🔸 نرخ وثیقه: <code>{ratio_pct('collateral_rate')}٪</code>\n"
+        "📝 کاربرد: درصدی از مبلغ وام که در لحظه تأیید نهایی سوپرادمین، به‌عنوان وثیقه از موجودی "
+        "قابل‌انتقال کاربر کسر و قفل می‌شود.\n"
+        "⚙️ تنظیم: <code>/set_collateral_rate [نسبت اعشاری]</code>\n\n"
+
+        "💰 <b>بخش: وام — نرخ موجودی اولیه موردنیاز</b>\n"
+        f"🔸 نرخ موجودی اولیه لازم: <code>{ratio_pct('required_balance_rate')}٪</code>\n"
+        "📝 کاربرد: حداقل درصدی از مبلغ وام که کاربر باید در موجودی قابل‌انتقال خود داشته باشد "
+        "تا بتواند درخواست وام وثیقه‌ای ثبت کند.\n"
+        "⚙️ تنظیم: <code>/set_req_balance_rate [نسبت اعشاری]</code>\n\n"
+
+        "⏰ <b>بخش: وام — نرخ جریمه دیرکرد</b>\n"
+        f"🔸 نرخ جریمه دیرکرد روزانه: <code>{ratio_pct('late_penalty_rate')}٪</code>\n"
+        "📝 کاربرد: درصد جریمه‌ای که به ازای هر روز تأخیر در پرداخت قسط، به مبلغ پایه همان قسط اضافه می‌شود.\n"
+        "⚙️ تنظیم: <code>/set_late_penalty_rate [نسبت اعشاری روزانه]</code>\n\n"
+
+        "🤝 <b>بخش: وام ضامنی — نرخ موجودی</b>\n"
+        f"🔸 نرخ گیرنده: <code>{ratio_pct('loan_guarantor_balance_rate_borrower')}٪</code>\n"
+        f"🔸 نرخ ضامن: <code>{ratio_pct('loan_guarantor_balance_rate_guarantor')}٪</code>\n"
+        "📝 کاربرد: درصد موجودی موردنیاز گیرنده و ضامن در وام‌های ضامنی.\n"
+        "⚙️ تنظیم: <code>/set_loan_guarantor_balance_rate [نرخ_گیرنده] [نرخ_ضامن]</code>\n\n"
+
+        "🔒 <b>بخش: وام ضامنی — نرخ وثیقه</b>\n"
+        f"🔸 نرخ گیرنده: <code>{ratio_pct('loan_guarantor_collateral_rate_borrower')}٪</code>\n"
+        f"🔸 نرخ ضامن: <code>{ratio_pct('loan_guarantor_collateral_rate_guarantor')}٪</code>\n"
+        "📝 کاربرد: درصد وثیقه موردنیاز گیرنده و ضامن در وام‌های ضامنی.\n"
+        "⚙️ تنظیم: <code>/set_loan_guarantor_collateral_rate [نرخ_گیرنده] [نرخ_ضامن]</code>"
+    )
+
+    await message.reply(txt, parse_mode="HTML")
+
+
+SHOP_REQUESTS_PAGE_SIZE = 10
+
+
+async def _fetch_pending_shop_requests():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM shops WHERE status = 'PENDING' ORDER BY shop_id") as cur:
+            return await cur.fetchall()
+
+
+def _render_shop_requests_page(requests, page: int):
+    total = len(requests)
+    total_pages = max(1, math.ceil(total / SHOP_REQUESTS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * SHOP_REQUESTS_PAGE_SIZE
+    page_items = requests[start:start + SHOP_REQUESTS_PAGE_SIZE]
+
+    txt = f"📥 <b>درخواست‌های ثبت فروشگاه (در انتظار بررسی) (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"درخواست‌های معلق: <code>{total}</code> مورد\n\n"
+
+    buttons = []
+    for req in page_items:
+        safe_title = html.escape(req["channel_title"] or "بدون نام")
+        txt += (
+            f"🔹 متقاضی: <code>{req['owner_id']}</code> | فروشگاه پیشنهادی: <b>{safe_title}</b> "
+            f"(شناسه: <code>{req['shop_id']}</code>)\n"
+        )
+        buttons.append([
+            InlineKeyboardButton(text=f"✅ تایید #{req['shop_id']}", callback_data=f"approve_shop_{req['shop_id']}"),
+            InlineKeyboardButton(text=f"❌ رد #{req['shop_id']}", callback_data=f"reject_shop_{req['shop_id']}"),
+        ])
+
+    pag_kb = _build_pagination_keyboard(page, total_pages, "shopreq_page", refresh_data="shopreq_refresh")
+    buttons.extend(pag_kb.inline_keyboard)
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    return txt, kb
+
+
+async def _shop_requests_reload(callback: CallbackQuery, page: int) -> None:
+    requests = await _fetch_pending_shop_requests()
+    if not requests:
+        try:
+            await callback.message.edit_text("✅ هیچ درخواست معلقی باقی نمانده است.")
+        except Exception:
+            pass
+        return
+    txt, kb = _render_shop_requests_page(requests, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
 @admin_router.message(Command("shop_requests"))
 async def cmd_shop_requests(message: Message):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM shops WHERE status = 'PENDING'") as cur:
-            requests = await cur.fetchall()
-
+    requests = await _fetch_pending_shop_requests()
     if not requests:
         return await message.reply("ℹ️ هیچ درخواست ثبت فروشگاهی وجود ندارد.")
+    txt, kb = _render_shop_requests_page(requests, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
 
-    for req in requests:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ تایید فروشگاه", callback_data=f"approve_shop_{req['shop_id']}"),
-            InlineKeyboardButton(text="❌ رد درخواست", callback_data=f"reject_shop_{req['shop_id']}")
-        ]])
-        safe_title = html.escape(req['channel_title'] or 'بدون نام')
-        safe_ch = html.escape(str(req['channel_id']))
-        await message.reply(
-            f"🏪 <b>درخواست ساخت فروشگاه</b>\n"
-            f"👤 مالکان: <code>{req['owner_id']}</code>\n"
-            f"📢 کانال/گروه: <b>{safe_title}</b> (<code>{safe_ch}</code>)",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+
+@admin_router.callback_query(F.data == "shopreq_page_noop")
+async def cb_shop_requests_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("shopreq_page_"))
+async def cb_shop_requests_page(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        return await callback.answer("عدم دسترسی", show_alert=True)
+    page = int(callback.data.split("_")[2])
+    await _shop_requests_reload(callback, page)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "shopreq_refresh")
+async def cb_shop_requests_refresh(callback: CallbackQuery):
+    if not is_super_admin(callback.from_user.id):
+        return await callback.answer("عدم دسترسی", show_alert=True)
+    page = _extract_current_page(callback.message.text or "")
+    await _shop_requests_reload(callback, page)
+    await callback.answer("🔄 لیست به‌روزرسانی شد.")
 
 
 @admin_router.callback_query(F.data.startswith("approve_shop_"))
@@ -2413,7 +4729,9 @@ async def cb_approve_shop(callback: CallbackQuery):
             shop = await cur.fetchone()
         await db.commit()
 
-    await callback.message.edit_text("✅ فروشگاه تایید شد.")
+    page = _extract_current_page(callback.message.text or "")
+    await _shop_requests_reload(callback, page)
+    await callback.answer("✅ فروشگاه تایید شد.")
     if shop:
         try:
             safe_title = html.escape(shop[1] or '')
@@ -2437,7 +4755,9 @@ async def cb_reject_shop(callback: CallbackQuery):
         await db.execute("DELETE FROM shops WHERE shop_id = ?", (shop_id,))
         await db.commit()
 
-    await callback.message.edit_text("❌ درخواست فروشگاه رد شد.")
+    page = _extract_current_page(callback.message.text or "")
+    await _shop_requests_reload(callback, page)
+    await callback.answer("❌ درخواست فروشگاه رد شد.")
     if shop:
         try:
             await callback.bot.send_message(shop[0], "❌ متأسفانه درخواست ثبت فروشگاه شما رد شد.")
@@ -2445,47 +4765,59 @@ async def cb_reject_shop(callback: CallbackQuery):
             pass
 
 
+
 @admin_router.message(Command("remove_shop"))
-async def cmd_remove_shop(message: Message):
+async def cmd_remove_shop(message: Message, state: FSMContext):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("راهنما: <code>/remove_shop [شناسه_فروشگاه]</code>", parse_mode="HTML")
-    shop_id = int(args[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM shops WHERE shop_id = ?", (shop_id,))
-        await db.execute("DELETE FROM products WHERE shop_id = ?", (shop_id,))
-        await db.commit()
-    await message.reply(f"🗑 فروشگاه شماره {shop_id} و محصولات آن حذف شدند.")
+    try:
+        shop_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ شناسه فروشگاه باید عدد باشد.")
+    preview_text = (
+        "🚨 <b>هشدار لغو مجوز فروشگاه</b>\n"
+        f"آیا از لغو مجوز فروشگاه {shop_id} و غیرفعال‌سازی تمام محصولات مرتبط با آن مطمئن هستید؟"
+    )
+    await _start_ops_confirmation(message, state, "remove_shop", preview_text, op_shop_id=shop_id)
 
 
 @admin_router.message(Command("add_courier"))
-async def cmd_add_courier(message: Message):
+async def cmd_add_courier(message: Message, state: FSMContext):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("راهنما: <code>/add_courier [آیدی_عددی_کاربر]</code>", parse_mode="HTML")
-    courier_id = int(args[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO couriers (user_id) VALUES (?)", (courier_id,))
-        await db.commit()
-    await message.reply(f"🚚 کاربر <code>{courier_id}</code> به لیست پستچی‌های مجاز اضافه شد.", parse_mode="HTML")
+    try:
+        courier_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ آیدی باید عدد باشد.")
+    preview_text = (
+        "🚚 <b>تأیید انتصاب پستچی</b>\n"
+        f"آیا از اعطای دسترسی‌های پستچی به کاربر <code>{courier_id}</code> اطمینان دارید؟"
+    )
+    await _start_ops_confirmation(message, state, "add_courier", preview_text, op_user_id=courier_id)
 
 
 @admin_router.message(Command("remove_courier"))
-async def cmd_remove_courier(message: Message):
+async def cmd_remove_courier(message: Message, state: FSMContext):
     if not is_private(message) or not is_super_admin(message.from_user.id):
         return
     args = message.text.split()
     if len(args) < 2:
         return await message.reply("راهنما: <code>/remove_courier [آیدی_عددی_کاربر]</code>", parse_mode="HTML")
-    courier_id = int(args[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM couriers WHERE user_id = ?", (courier_id,))
-        await db.commit()
-    await message.reply(f"🔥 کاربر <code>{courier_id}</code> از لیست پستچی‌ها حذف شد.", parse_mode="HTML")
+    try:
+        courier_id = int(args[1])
+    except ValueError:
+        return await message.reply("❌ آیدی باید عدد باشد.")
+    preview_text = (
+        "⚠️ <b>تأیید سلب دسترسی پستچی</b>\n"
+        f"آیا از حذف کاربر <code>{courier_id}</code> از لیست پستچی‌ها اطمینان دارید؟"
+    )
+    await _start_ops_confirmation(message, state, "remove_courier", preview_text, op_user_id=courier_id)
 
 
 # --- ۲. دستورات فروشندگان (Shop Owners) ---
@@ -2494,20 +4826,35 @@ async def cmd_remove_courier(message: Message):
 async def cmd_request_shop(message: Message, state: FSMContext):
     if not is_private(message):
         return
-    await message.reply("لطفاً آیدی عددی یا یوزرنیم کانال/گروه خود را ارسال کنید (مثال: @mychannel یا -100123456789):")
+    prompt = await message.reply("لطفاً آیدی عددی یا یوزرنیم کانال/گروه خود را ارسال کنید (مثال: @mychannel یا -100123456789):")
     await state.set_state(RequestShopForm.waiting_for_channel)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
 
 
 @shop_router.message(RequestShopForm.waiting_for_channel)
 async def process_request_shop_channel(message: Message, state: FSMContext):
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     channel_raw = message.text.strip()
+    def _reschedule():
+        current_state = RequestShopForm.waiting_for_channel.state
+        schedule_input_timeout(
+            state, message.chat.id, message.from_user.id, current_state,
+            lambda: _default_timeout_notice(message.bot, message.chat.id, None),
+        )
+
     try:
         chat = await message.bot.get_chat(channel_raw)
         bot_member = await message.bot.get_chat_member(chat.id, message.bot.id)
         if bot_member.status not in ["administrator", "creator"]:
-            return await message.reply("⚠️ ربات در این کانال/گروه ادمین نیست! ابتدا ربات را ادمین کنید و مجدداً تلاش کنید.")
+            await message.reply("⚠️ ربات در این کانال/گروه ادمین نیست! ابتدا ربات را ادمین کنید و مجدداً تلاش کنید.")
+            return _reschedule()
     except Exception as e:
-        return await message.reply(f"❌ یافتن کانال/گروه با خطا مواجه شد. از ادمین بودن ربات و صحت آیدی مطمئن شوید.\nخطا: {e}")
+        await message.reply(f"❌ یافتن کانال/گروه با خطا مواجه شد. از ادمین بودن ربات و صحت آیدی مطمئن شوید.\nخطا: {e}")
+        return _reschedule()
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -2533,36 +4880,65 @@ async def cmd_add_product(message: Message, state: FSMContext):
         return await message.reply("❌ شما هیچ فروشگاه تاییدشده‌ای ندارید.")
 
     await state.update_data(shop_id=shops[0]["shop_id"], channel_id=shops[0]["channel_id"])
-    await message.reply("📸 لطفاً عکس محصول را ارسال کنید:")
+    prompt = await message.reply("📸 لطفاً عکس محصول را ارسال کنید:")
     await state.set_state(AddProductForm.waiting_for_photo)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
 
 
 @shop_router.message(AddProductForm.waiting_for_photo, F.photo)
 async def process_product_photo(message: Message, state: FSMContext):
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     photo_id = message.photo[-1].file_id
     await state.update_data(photo_id=photo_id)
-    await message.reply("🏷 نام محصول را وارد کنید:")
+    prompt = await message.reply("🏷 نام محصول را وارد کنید:")
     await state.set_state(AddProductForm.waiting_for_title)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
 
 
 @shop_router.message(AddProductForm.waiting_for_title)
 async def process_product_title(message: Message, state: FSMContext):
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     await state.update_data(title=message.text.strip())
-    await message.reply("📝 توضیحات محصول را وارد کنید:")
+    prompt = await message.reply("📝 توضیحات محصول را وارد کنید:")
     await state.set_state(AddProductForm.waiting_for_description)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
 
 
 @shop_router.message(AddProductForm.waiting_for_description)
 async def process_product_desc(message: Message, state: FSMContext):
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     await state.update_data(description=message.text.strip())
-    await message.reply("💰 قیمت محصول (به آتر) را وارد کنید:")
+    prompt = await message.reply("💰 قیمت محصول (به آتر) را وارد کنید:")
     await state.set_state(AddProductForm.waiting_for_price)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
 
 
 @shop_router.message(AddProductForm.waiting_for_price)
 async def process_product_price(message: Message, state: FSMContext):
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     if not message.text.isdigit() or int(message.text) <= 0:
-        return await message.reply("❌ قیمت باید یک عدد مثبت باشد.")
+        await message.reply("❌ قیمت باید یک عدد مثبت باشد.")
+        current_state = await state.get_state()
+        return schedule_input_timeout(
+            state, message.chat.id, message.from_user.id, current_state,
+            lambda: _default_timeout_notice(message.bot, message.chat.id, None),
+        )
     await state.update_data(price=int(message.text))
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -2570,25 +4946,23 @@ async def process_product_price(message: Message, state: FSMContext):
         InlineKeyboardButton(text="محدود", callback_data="st_LIMITED"),
         InlineKeyboardButton(text="نامحدود", callback_data="st_UNLIMITED"),
     ]])
-    await message.reply("📦 نوع موجودی محصول را انتخاب کنید:", reply_markup=kb)
+    prompt = await message.reply("📦 نوع موجودی محصول را انتخاب کنید:", reply_markup=kb)
     await state.set_state(AddProductForm.waiting_for_stock_type)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
 
 
 @shop_router.callback_query(AddProductForm.waiting_for_stock_type, F.data.startswith("st_"))
 async def process_product_stock_type(callback: CallbackQuery, state: FSMContext):
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
     st_type = callback.data.split("_")[1]
     await state.update_data(stock_type=st_type)
 
-    if st_type == "SINGLE":
-        await state.update_data(stock_qty=1)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="بله (نیازمند پستچی)", callback_data="cour_YES"),
-            InlineKeyboardButton(text="خیر (دیجیتالی/مستقیم)", callback_data="cour_NO"),
-        ]])
-        await callback.message.edit_text("🚚 آیا این محصول نیاز به پستچی دارد؟", reply_markup=kb)
-        await state.set_state(AddProductForm.waiting_for_needs_courier)
-    elif st_type == "UNLIMITED":
-        await state.update_data(stock_qty=-1)
+    if st_type in ("SINGLE", "UNLIMITED"):
+        await state.update_data(stock_qty=1 if st_type == "SINGLE" else -1)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="بله (نیازمند پستچی)", callback_data="cour_YES"),
             InlineKeyboardButton(text="خیر (دیجیتالی/مستقیم)", callback_data="cour_NO"),
@@ -2599,33 +4973,78 @@ async def process_product_stock_type(callback: CallbackQuery, state: FSMContext)
         await callback.message.edit_text("تعداد موجودی را به عدد وارد کنید:")
         await state.set_state(AddProductForm.waiting_for_stock)
 
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, callback.from_user.id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
+
 
 @shop_router.message(AddProductForm.waiting_for_stock)
 async def process_product_stock_qty(message: Message, state: FSMContext):
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     if not message.text.isdigit() or int(message.text) <= 0:
-        return await message.reply("❌ تعداد موجودی باید عدد مثبت باشد.")
+        await message.reply("❌ تعداد موجودی باید عدد مثبت باشد.")
+        current_state = await state.get_state()
+        return schedule_input_timeout(
+            state, message.chat.id, message.from_user.id, current_state,
+            lambda: _default_timeout_notice(message.bot, message.chat.id, None),
+        )
     await state.update_data(stock_qty=int(message.text))
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="بله (نیازمند پستچی)", callback_data="cour_YES"),
         InlineKeyboardButton(text="خیر (دیجیتالی/مستقیم)", callback_data="cour_NO"),
     ]])
-    await message.reply("🚚 آیا این محصول نیاز به پستچی دارد؟", reply_markup=kb)
+    prompt = await message.reply("🚚 آیا این محصول نیاز به پستچی دارد؟", reply_markup=kb)
     await state.set_state(AddProductForm.waiting_for_needs_courier)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
+
+
+async def _generate_unique_product_code(db) -> str:
+    """
+    تولید یک کد یکتای غیرتکراری برای محصول (هم‌سبک با کد ۱۰ رقمی امنیتی سفارش‌ها)،
+    که پس از ثبت محصول در دیتابیس ذخیره شده و مبنای مدیریت و حذف بعدی محصول قرار می‌گیرد.
+    """
+    for _ in range(20):
+        candidate = "PRD-" + "".join(random.choices(string.digits, k=8))
+        async with db.execute(
+            "SELECT 1 FROM products WHERE product_code = ?", (candidate,)
+        ) as cur:
+            if not await cur.fetchone():
+                return candidate
+    # fallback بسیار بعید (در صورت تصادم مکرر): افزودن مهر زمانی برای تضمین یکتایی
+    return "PRD-" + datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
 
 
 @shop_router.callback_query(AddProductForm.waiting_for_needs_courier, F.data.startswith("cour_"))
 async def process_product_final(callback: CallbackQuery, state: FSMContext):
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
     needs_courier = (callback.data.split("_")[1] == "YES")
     data = await state.get_data()
     await state.clear()
 
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            """INSERT INTO products (shop_id, photo_id, title, description, price, stock_type, stock_qty, needs_courier)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (data["shop_id"], data["photo_id"], data["title"], data["description"], data["price"], data["stock_type"], data["stock_qty"], needs_courier)
+        product_code = await _generate_unique_product_code(db)
+        insert_sql = (
+            """INSERT INTO products (shop_id, photo_id, title, description, price, stock_type, stock_qty, needs_courier, product_code)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"""
         )
+        insert_args = (
+            data["shop_id"], data["photo_id"], data["title"], data["description"],
+            data["price"], data["stock_type"], data["stock_qty"], needs_courier, product_code,
+        )
+        try:
+            cursor = await db.execute(insert_sql, insert_args)
+        except sqlite3.IntegrityError:
+            # احتمال بسیار نادر تصادم هم‌زمان کد؛ یک‌بار با کد جدید تلاش مجدد می‌شود
+            product_code = await _generate_unique_product_code(db)
+            insert_args = insert_args[:-1] + (product_code,)
+            cursor = await db.execute(insert_sql, insert_args)
         product_id = cursor.lastrowid
         await db.commit()
 
@@ -2656,10 +5075,150 @@ async def process_product_final(callback: CallbackQuery, state: FSMContext):
             await db.execute("UPDATE products SET channel_msg_id = ? WHERE product_id = ?", (sent_msg.message_id, product_id))
             await db.commit()
     except Exception as e:
-        await callback.message.edit_text(f"⚠️ محصول ثبت شد اما بنر در کانال ارسال نشد. مطمئن شوید ربات ادمین کانال است.\nخطا: {e}")
+        await callback.message.edit_text(
+            f"⚠️ محصول ثبت شد اما بنر در کانال ارسال نشد. مطمئن شوید ربات ادمین کانال است.\n"
+            f"🏷 کد محصول: <code>{product_code}</code>\n"
+            f"خطا: {e}",
+            parse_mode="HTML",
+        )
         return
 
-    await callback.message.edit_text("🎉 محصول با موفقیت ثبت شد و بنر خرید در کانال قرار گرفت.")
+    await callback.message.edit_text(
+        f"🎉 محصول با موفقیت ثبت شد و بنر خرید در کانال قرار گرفت.\n"
+        f"🏷 کد محصول: <code>{product_code}</code>",
+        parse_mode="HTML",
+    )
+
+
+
+# =====================================================================================
+# 📦 دستور /inventory: نمایش لیست محصولات (با صفحه‌بندی) و مدیریت محصول با کد
+# =====================================================================================
+_PRODUCT_TYPE_LABELS = {"SINGLE": "تکی", "LIMITED": "محدود", "UNLIMITED": "نامحدود"}
+INVENTORY_PAGE_SIZE = 10
+
+
+async def _fetch_owner_products(owner_id: int):
+    """تمام محصولات فروشگاه(های) تأییدشده یک فروشنده را برمی‌گرداند (برای لیست و صفحه‌بندی)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT p.* FROM products p JOIN shops s ON p.shop_id = s.shop_id "
+            "WHERE s.owner_id = ? AND s.status = 'APPROVED' ORDER BY p.product_id ASC",
+            (owner_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+
+def _build_pagination_keyboard(page: int, total_pages: int, page_prefix: str, noop_data: str = None, refresh_data: str = None) -> InlineKeyboardMarkup:
+    """کیبورد استاندارد صفحه‌بندی: ردیف اول ۳ دکمه (◀️ قبلی | 📄 صفحه X از Y | بعدی ▶️)، و در صورت
+    ارسال `refresh_data`، یک ردیف دوم اختیاری شامل دکمه «🔄 به‌روزرسانی لیست».
+    `page` صفر-پایه است. در صفحه اول دکمه «قبلی» و در صفحه آخر دکمه «بعدی» پنهان می‌شود (طبق مدیریت لبه‌ها)."""
+    if noop_data is None:
+        noop_data = f"{page_prefix}_noop"
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton(text="◀️ قبلی", callback_data=f"{page_prefix}_{page - 1}"))
+    row.append(InlineKeyboardButton(text=f"📄 صفحه {page + 1} از {total_pages}", callback_data=noop_data))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton(text="بعدی ▶️", callback_data=f"{page_prefix}_{page + 1}"))
+    keyboard = [row]
+    if refresh_data:
+        keyboard.append([InlineKeyboardButton(text="🔄 به‌روزرسانی لیست", callback_data=refresh_data)])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _extract_current_page(text: str) -> int:
+    """شماره صفحه فعلی (صفر-پایه) را از عنوان پیام صفحه‌بندی‌شده («... صفحه X از Y ...») استخراج می‌کند؛
+    برای اینکه دکمه «🔄 به‌روزرسانی لیست» بتواند همان صفحه فعلی را دوباره بارگذاری کند."""
+    m = re.search(r"صفحه (\d+) از", text or "")
+    if m:
+        try:
+            return max(0, int(m.group(1)) - 1)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _render_inventory_page(products, page: int):
+    """متن و کیبورد صفحه‌بندی‌شده‌ی لیست محصولات را می‌سازد (حداکثر ۱۰ محصول در هر صفحه)."""
+    total = len(products)
+    total_pages = max(1, math.ceil(total / INVENTORY_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * INVENTORY_PAGE_SIZE
+    page_items = products[start:start + INVENTORY_PAGE_SIZE]
+
+    txt = f"📋 <b>انبار و موجودی فروشگاه (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"تعداد کل محصولات: <code>{total}</code> کد کالا\n\n"
+    for p in page_items:
+        safe_title = html.escape(p["title"])
+        code_display = p["product_code"] or f"#{p['product_id']}"
+        stock_display = "نامحدود" if p["stock_type"] == "UNLIMITED" else f"{p['stock_qty']} عدد"
+        txt += (
+            f"🔹 کد: <code>{code_display}</code> | نام: <b>{safe_title}</b> | "
+            f"قیمت: <code>₳ {p['price']}</code> | موجودی: <b>{stock_display}</b>\n"
+        )
+    txt += "\nℹ️ برای مدیریت هر محصول: <code>/inventory [کد_محصول]</code>"
+
+    kb = _build_pagination_keyboard(page, total_pages, "inv_page", noop_data="inv_noop")
+    return txt, kb
+
+
+async def _get_owned_product(owner_id: int, product_code: str):
+    """محصول را از روی کد یکتا واکشی می‌کند؛ فقط اگر متعلق به فروشگاه تأییدشده همان فروشنده باشد چیزی برمی‌گرداند."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT p.*, s.owner_id AS shop_owner_id, s.channel_id AS shop_channel_id, s.status AS shop_status
+               FROM products p JOIN shops s ON p.shop_id = s.shop_id
+               WHERE p.product_code = ?""",
+            (product_code,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row or row["shop_owner_id"] != owner_id or row["shop_status"] != "APPROVED":
+        return None
+    return row
+
+
+def _product_management_view(p):
+    """متن و کیبورد صفحه مدیریت یک محصول را بر اساس نوع موجودی آن می‌سازد."""
+    type_label = _PRODUCT_TYPE_LABELS.get(p["stock_type"], p["stock_type"])
+    code_display = p["product_code"] or f"#{p['product_id']}"
+    safe_title = html.escape(p["title"])
+    stock_display = "نامحدود" if p["stock_type"] == "UNLIMITED" else f"{p['stock_qty']} عدد"
+
+    text = (
+        "📦 <b>مدیریت محصول</b>\n\n"
+        f"🏷 نام: <b>{safe_title}</b>\n"
+        f"🔢 کد: <code>{code_display}</code>\n"
+        f"🏷 نوع: <b>{type_label}</b>\n"
+        f"💰 قیمت فعلی: <code>₳ {p['price']}</code>\n"
+        f"📦 موجودی فعلی: <b>{stock_display}</b>"
+    )
+
+    if p["stock_type"] == "SINGLE":
+        text += "\n\n⚠️ محصولات تکی قابل ویرایش نیستند."
+        return text, None
+
+    buttons = [InlineKeyboardButton(text="💰 تغییر قیمت", callback_data=f"pmgmt_price_{p['product_id']}")]
+    if p["stock_type"] == "LIMITED":
+        buttons.append(InlineKeyboardButton(text="📦 تغییر موجودی", callback_data=f"pmgmt_stock_{p['product_id']}"))
+    kb = InlineKeyboardMarkup(inline_keyboard=[buttons])
+    return text, kb
+
+
+async def _notify_channel_product_updated(bot: Bot, channel_id, channel_msg_id) -> None:
+    """پس از به‌روزرسانی اطلاعات محصول، ربات روی همان پست محصول در کانال ریپلای می‌کند."""
+    if not channel_id or not channel_msg_id:
+        return
+    try:
+        await bot.send_message(
+            chat_id=channel_id,
+            text="اطلاعات این محصول به‌روزرسانی شد.",
+            reply_to_message_id=channel_msg_id,
+        )
+    except Exception:
+        pass
 
 
 @shop_router.message(Command("inventory"))
@@ -2669,20 +5228,326 @@ async def cmd_inventory(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT p.* FROM products p JOIN shops s ON p.shop_id = s.shop_id WHERE s.owner_id = ?",
-            (message.from_user.id,)
+            "SELECT * FROM shops WHERE owner_id = ? AND status = 'APPROVED'", (message.from_user.id,)
         ) as cur:
-            products = await cur.fetchall()
+            shops = await cur.fetchall()
+    if not shops:
+        return await message.reply(
+            "❌ شما فروشگاه تأییدشده‌ای ندارید. برای ثبت فروشگاه از <code>/request_shop</code> استفاده کنید.",
+            parse_mode="HTML",
+        )
 
+    args = message.text.split(maxsplit=1)
+
+    # حالت اول: /inventory بدون آرگومان -> فقط نمایش لیست محصولات (با صفحه‌بندی)
+    if len(args) < 2 or not args[1].strip():
+        products = await _fetch_owner_products(message.from_user.id)
+        if not products:
+            return await message.reply("📦 شما هیچ محصولی ثبت نکرده‌اید.")
+        txt, kb = _render_inventory_page(products, 0)
+        return await message.reply(txt, reply_markup=kb, parse_mode="HTML")
+
+    # حالت دوم: /inventory [کد_محصول] -> صفحه مدیریت همان محصول
+    product = await _get_owned_product(message.from_user.id, args[1].strip())
+    if not product:
+        return await message.reply("❌ محصولی با این کد برای شما یافت نشد.")
+
+    text, kb = _product_management_view(product)
+    await message.reply(text, reply_markup=kb, parse_mode="HTML")
+
+
+@shop_router.callback_query(F.data == "inv_noop")
+async def cb_inventory_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@shop_router.callback_query(F.data.startswith("inv_page_"))
+async def cb_inventory_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    products = await _fetch_owner_products(callback.from_user.id)
     if not products:
-        return await message.reply("📦 شما هیچ محصولی ثبت نکرده‌اید.")
+        return await callback.answer("📦 محصولی یافت نشد.", show_alert=True)
+    txt, kb = _render_inventory_page(products, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
 
-    txt = "📦 <b>مدیریت انبار و موجودی:</b>\n\n"
-    for p in products:
-        st_str = "نامحدود" if p["stock_type"] == "UNLIMITED" else f"{p['stock_qty']} عدد"
-        safe_title = html.escape(p['title'])
-        txt += f"🔹 کد: <code>{p['product_id']}</code> | <b>{safe_title}</b> | قیمت: <code>₳ {p['price']}</code> | موجودی: <b>{st_str}</b>\n"
-    await message.reply(txt, parse_mode="HTML")
+
+@shop_router.callback_query(F.data.startswith("pmgmt_price_"))
+async def cb_product_edit_price(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split("_")[2])
+    owner_id = callback.from_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT p.*, s.owner_id AS shop_owner_id, s.status AS shop_status
+               FROM products p JOIN shops s ON p.shop_id = s.shop_id WHERE p.product_id = ?""",
+            (product_id,)
+        ) as cur:
+            product = await cur.fetchone()
+
+    if not product or product["shop_owner_id"] != owner_id or product["shop_status"] != "APPROVED":
+        return await callback.answer("❌ این محصول یافت نشد یا متعلق به شما نیست.", show_alert=True)
+    if product["stock_type"] == "SINGLE":
+        return await callback.answer("⚠️ محصولات تکی قابل ویرایش نیستند.", show_alert=True)
+
+    chat_id = callback.message.chat.id
+    message_id = callback.message.message_id
+    try:
+        await callback.message.edit_text(
+            f"💰 قیمت جدید محصول «<b>{html.escape(product['title'])}</b>» را با ریپلای روی همین پیام ارسال کنید:",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await state.update_data(
+        pmgmt_product_id=product_id, pmgmt_chat_id=chat_id, pmgmt_msg_id=message_id, pmgmt_owner=owner_id,
+    )
+    await state.set_state(ProductEditForm.waiting_for_new_price)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, chat_id, owner_id, current_state,
+        lambda: _default_timeout_notice(callback.bot, chat_id, message_id),
+    )
+    await callback.answer()
+
+
+@shop_router.callback_query(F.data.startswith("pmgmt_stock_"))
+async def cb_product_edit_stock(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split("_")[2])
+    owner_id = callback.from_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT p.*, s.owner_id AS shop_owner_id, s.status AS shop_status
+               FROM products p JOIN shops s ON p.shop_id = s.shop_id WHERE p.product_id = ?""",
+            (product_id,)
+        ) as cur:
+            product = await cur.fetchone()
+
+    if not product or product["shop_owner_id"] != owner_id or product["shop_status"] != "APPROVED":
+        return await callback.answer("❌ این محصول یافت نشد یا متعلق به شما نیست.", show_alert=True)
+    if product["stock_type"] != "LIMITED":
+        return await callback.answer("⚠️ تغییر موجودی فقط برای محصولات محدود امکان‌پذیر است.", show_alert=True)
+
+    chat_id = callback.message.chat.id
+    message_id = callback.message.message_id
+    try:
+        await callback.message.edit_text(
+            f"📦 تعداد موجودی جدید محصول «<b>{html.escape(product['title'])}</b>» را با ریپلای روی همین پیام ارسال کنید:",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    await state.update_data(
+        pmgmt_product_id=product_id, pmgmt_chat_id=chat_id, pmgmt_msg_id=message_id, pmgmt_owner=owner_id,
+    )
+    await state.set_state(ProductEditForm.waiting_for_new_stock)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, chat_id, owner_id, current_state,
+        lambda: _default_timeout_notice(callback.bot, chat_id, message_id),
+    )
+    await callback.answer()
+
+
+@shop_router.message(ProductEditForm.waiting_for_new_price)
+async def process_product_new_price(message: Message, state: FSMContext):
+    data = await state.get_data()
+    owner_id = message.from_user.id
+    if owner_id != data.get("pmgmt_owner"):
+        return
+    chat_id = data.get("pmgmt_chat_id", message.chat.id)
+    msg_id = data.get("pmgmt_msg_id")
+    product_id = data.get("pmgmt_product_id")
+
+    if not message.reply_to_message or message.reply_to_message.message_id != msg_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text="⚠️ لطفاً روی همین پیام ریپلای کرده و قیمت جدید را ارسال کنید.",
+            )
+        except Exception:
+            pass
+        return
+
+    cancel_input_timeout(chat_id, owner_id)
+
+    async def _fail(note_text: str):
+        await state.clear()
+        try:
+            await message.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=note_text)
+        except Exception:
+            pass
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    try:
+        new_price = int(message.text.strip())
+    except (ValueError, AttributeError):
+        return await _fail("❌ مقدار وارد شده نامعتبر است. برای تلاش مجدد دوباره از /inventory اقدام کنید.")
+    if new_price <= 0:
+        return await _fail("❌ قیمت باید مثبت باشد. برای تلاش مجدد دوباره از /inventory اقدام کنید.")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT p.*, s.owner_id AS shop_owner_id, s.channel_id AS shop_channel_id, s.status AS shop_status
+               FROM products p JOIN shops s ON p.shop_id = s.shop_id WHERE p.product_id = ?""",
+            (product_id,)
+        ) as cur:
+            product = await cur.fetchone()
+
+        if not product or product["shop_owner_id"] != owner_id or product["shop_status"] != "APPROVED":
+            return await _fail("❌ این محصول دیگر یافت نشد یا متعلق به شما نیست.")
+        if product["stock_type"] == "SINGLE":
+            return await _fail("⚠️ محصولات تکی قابل ویرایش نیستند.")
+
+        await db.execute("UPDATE products SET price = ? WHERE product_id = ?", (new_price, product_id))
+        await db.commit()
+
+        async with db.execute(
+            """SELECT p.*, s.channel_id AS shop_channel_id FROM products p
+               JOIN shops s ON p.shop_id = s.shop_id WHERE p.product_id = ?""",
+            (product_id,)
+        ) as cur2:
+            updated_product = await cur2.fetchone()
+
+    await state.clear()
+    text, kb = _product_management_view(updated_product)
+    text = f"✅ قیمت با موفقیت به‌روزرسانی شد.\n\n{text}"
+    try:
+        await message.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _notify_channel_product_updated(message.bot, updated_product["shop_channel_id"], updated_product["channel_msg_id"])
+
+
+@shop_router.message(ProductEditForm.waiting_for_new_stock)
+async def process_product_new_stock(message: Message, state: FSMContext):
+    data = await state.get_data()
+    owner_id = message.from_user.id
+    if owner_id != data.get("pmgmt_owner"):
+        return
+    chat_id = data.get("pmgmt_chat_id", message.chat.id)
+    msg_id = data.get("pmgmt_msg_id")
+    product_id = data.get("pmgmt_product_id")
+
+    if not message.reply_to_message or message.reply_to_message.message_id != msg_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text="⚠️ لطفاً روی همین پیام ریپلای کرده و تعداد موجودی جدید را ارسال کنید.",
+            )
+        except Exception:
+            pass
+        return
+
+    cancel_input_timeout(chat_id, owner_id)
+
+    async def _fail(note_text: str):
+        await state.clear()
+        try:
+            await message.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=note_text)
+        except Exception:
+            pass
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    raw = (message.text or "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        return await _fail("❌ مقدار وارد شده نامعتبر است. برای تلاش مجدد دوباره از /inventory اقدام کنید.")
+    new_stock = int(raw)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT p.*, s.owner_id AS shop_owner_id, s.channel_id AS shop_channel_id, s.status AS shop_status
+               FROM products p JOIN shops s ON p.shop_id = s.shop_id WHERE p.product_id = ?""",
+            (product_id,)
+        ) as cur:
+            product = await cur.fetchone()
+
+        if not product or product["shop_owner_id"] != owner_id or product["shop_status"] != "APPROVED":
+            return await _fail("❌ این محصول دیگر یافت نشد یا متعلق به شما نیست.")
+        if product["stock_type"] != "LIMITED":
+            return await _fail("⚠️ تغییر موجودی فقط برای محصولات محدود امکان‌پذیر است.")
+
+        await db.execute("UPDATE products SET stock_qty = ? WHERE product_id = ?", (new_stock, product_id))
+        await db.commit()
+
+        async with db.execute(
+            """SELECT p.*, s.channel_id AS shop_channel_id FROM products p
+               JOIN shops s ON p.shop_id = s.shop_id WHERE p.product_id = ?""",
+            (product_id,)
+        ) as cur2:
+            updated_product = await cur2.fetchone()
+
+    await state.clear()
+    text, kb = _product_management_view(updated_product)
+    text = f"✅ موجودی با موفقیت به‌روزرسانی شد.\n\n{text}"
+    try:
+        await message.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await _notify_channel_product_updated(message.bot, updated_product["shop_channel_id"], updated_product["channel_msg_id"])
+
+
+# =====================================================================================
+# 🗑 دستور /delete: حذف محصول (بدون هیچ‌گونه تأثیر بر دارایی/تراکنش مالی هیچ کاربری)
+# =====================================================================================
+@shop_router.message(Command("delete"))
+async def cmd_delete_product(message: Message, state: FSMContext):
+    if not is_private(message):
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        return await message.reply("راهنما: <code>/delete [کد_محصول]</code>", parse_mode="HTML")
+
+    product_code = args[1].strip()
+    owner_id = message.from_user.id
+
+    # محصول باید وجود داشته باشد، حذف نشده باشد و متعلق به همان فروشنده باشد؛
+    # در غیر این صورت هیچ تغییری اعمال نمی‌شود و فقط پیام مناسب نمایش داده می‌شود.
+    product = await _get_owned_product(owner_id, product_code)
+    if not product:
+        return await message.reply("❌ محصولی با این کد برای شما یافت نشد.")
+
+    safe_title = html.escape(product["title"])
+    safe_code = html.escape(product_code)
+    preview_text = (
+        "⚠️ <b>هشدار حذف محصول</b>\n"
+        f"آیا از حذف محصول با کد {safe_code} ({safe_title}) اطمینان دارید؟ این عملیات غیرقابل بازگشت است."
+    )
+    await _start_ops_confirmation(
+        message, state, "delete_product", preview_text,
+        op_product_id=product["product_id"],
+        op_channel_id=product["shop_channel_id"],
+        op_channel_msg_id=product["channel_msg_id"],
+        op_product_title=product["title"],
+    )
+
 
 
 @shop_router.message(Command("my_shop"))
@@ -2691,11 +5556,13 @@ async def cmd_my_shop(message: Message):
         return
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM shops WHERE owner_id = ?", (message.from_user.id,)) as cur:
+        async with db.execute(
+            "SELECT * FROM shops WHERE owner_id = ? AND status = 'APPROVED'", (message.from_user.id,)
+        ) as cur:
             shops = await cur.fetchall()
 
         if not shops:
-            return await message.reply("❌ شما هیچ فروشگاهی ندارید.")
+            return await message.reply("❌ شما فروشگاه تأییدشده‌ای ندارید. برای ثبت فروشگاه از <code>/request_shop</code> استفاده کنید.", parse_mode="HTML")
 
         shop = shops[0]
         async with db.execute(
@@ -2745,7 +5612,7 @@ async def cb_initiate_buy(callback: CallbackQuery):
                     show_alert=True
                 )
 
-        async with db.execute("SELECT balance, is_frozen FROM users WHERE user_id = ?", (buyer_id,)) as cur_u:
+        async with db.execute("SELECT balance, frozen_balance, is_frozen FROM users WHERE user_id = ?", (buyer_id,)) as cur_u:
             buyer = await cur_u.fetchone()
 
     if not buyer or buyer["is_frozen"]:
@@ -2765,7 +5632,8 @@ async def cb_initiate_buy(callback: CallbackQuery):
             courier_fee = int(price * (t3 / 100.0))
     total_cost = price + courier_fee
 
-    if buyer["balance"] < total_cost:
+    buyer_transferable = max(0, buyer["balance"] - buyer["frozen_balance"])
+    if buyer_transferable < total_cost:
         return await callback.answer(f"❌ موجودی ناکافی! قیمت محصول: ₳ {price} + هزینه پست: ₳ {courier_fee} = مجموع: ₳ {total_cost}", show_alert=True)
 
     safe_title = html.escape(prod['title'])
@@ -2843,7 +5711,7 @@ async def cb_confirm_buy(callback: CallbackQuery):
                         pass
                     return
 
-            async with db.execute("SELECT balance, is_frozen FROM users WHERE user_id = ?", (buyer_id,)) as cur_u:
+            async with db.execute("SELECT balance, frozen_balance, is_frozen FROM users WHERE user_id = ?", (buyer_id,)) as cur_u:
                 buyer = await cur_u.fetchone()
 
             if not buyer or buyer["is_frozen"]:
@@ -2866,7 +5734,9 @@ async def cb_confirm_buy(callback: CallbackQuery):
 
             total_cost = price + courier_fee
 
-            if buyer["balance"] < total_cost:
+            # 🔒 موجودی قابل‌استفاده (غیر از مبالغ قبلاً فریزشده مثل وثیقه وام یا سفارش‌های دیگر)
+            transferable = max(0, buyer["balance"] - buyer["frozen_balance"])
+            if transferable < total_cost:
                 await callback.answer(f"❌ موجودی ناکافی! قیمت محصول: ₳ {price} + هزینه پست: ₳ {courier_fee} = مجموع: ₳ {total_cost}", show_alert=True)
                 try:
                     await callback.message.edit_text("❌ موجودی حساب شما برای این خرید کافی نیست.")
@@ -2874,28 +5744,34 @@ async def cb_confirm_buy(callback: CallbackQuery):
                     pass
                 return
 
-            # کسر مبلغ از خریدار
-            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total_cost, buyer_id))
-
-            # 🏛 هزینه پست دریافتی از خریدار به‌عنوان درآمد سیستم به خزانه مرکزی واریز می‌شود
-            # (سهم پستچی بعداً هنگام تایید تحویل، از همین خزانه به او پرداخت خواهد شد)
-            if courier_fee > 0:
-                await treasury_credit(db, courier_fee, f"هزینه پست دریافتی سفارش محصول #{product_id}", related_user=buyer_id)
-
-            # تقسیم کالا: ۵۱٪ فروشنده، ۴۰٪ بانک، ۹٪ سوخت
+            # مالک فروشگاه (برای پرداخت سهم فروشنده در حالت آنی، و اطلاع‌رسانی در هر دو حالت)
             async with db.execute("SELECT owner_id FROM shops WHERE shop_id = ?", (prod["shop_id"],)) as cur_s:
                 shop_owner_id = (await cur_s.fetchone())["owner_id"]
 
-            s_pct = await get_setting("shop_seller_pct")
-            b_pct = await get_setting("shop_bank_pct")
+            if prod["needs_courier"]:
+                # 🧊 سفارش‌های نیازمند پستچی: مبلغ کل (قیمت + هزینه پست) از balance خریدار
+                # کسر و هم‌زمان به frozen_balance او اضافه می‌شود. هیچ پولی بین خریدار/فروشنده/
+                # بانک/پستچی جابه‌جا نمی‌شود. تسویه نهایی و واقعی فقط پس از تایید تحویل توسط
+                # پستچی (/confirm_dispatch) انجام خواهد شد.
+                await db.execute(
+                    "UPDATE users SET balance = balance - ?, frozen_balance = frozen_balance + ? WHERE user_id = ?",
+                    (total_cost, total_cost, buyer_id)
+                )
+            else:
+                # 📦 محصولات بدون نیاز به پستچی: تحویل فوری و دیجیتالی است، بنابراین تسویه
+                # مالی نیز بلافاصله و مطابق منطق قبلی پروژه انجام می‌شود (بدون فریز).
+                await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (total_cost, buyer_id))
 
-            seller_share = int(price * (s_pct / 100.0))
-            bank_share = int(price * (b_pct / 100.0))
-            # باقی مانده درصد سوخت (امحا) می‌شود و به حسابی واریز نمی‌شود.
+                s_pct = await get_setting("shop_seller_pct")
+                b_pct = await get_setting("shop_bank_pct")
 
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (seller_share, shop_owner_id))
-            # 🏛 سهم بانک از فروش، به‌عنوان درآمد سیستم مستقیماً به خزانه مرکزی واریز می‌شود
-            await treasury_credit(db, bank_share, f"سهم بانک از فروش محصول #{product_id}", related_user=shop_owner_id)
+                seller_share = int(price * (s_pct / 100.0))
+                bank_share = int(price * (b_pct / 100.0))
+                # باقی مانده درصد سوخت (امحا) می‌شود و به حسابی واریز نمی‌شود.
+
+                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (seller_share, shop_owner_id))
+                # 🏛 سهم بانک از فروش، به‌عنوان درآمد سیستم مستقیماً به خزانه مرکزی واریز می‌شود
+                await treasury_credit(db, bank_share, f"سهم بانک از فروش محصول #{product_id}", related_user=shop_owner_id)
 
             # کسر از موجودی انبار
             new_qty = prod["stock_qty"]
@@ -2909,11 +5785,11 @@ async def cb_confirm_buy(callback: CallbackQuery):
             # ثبت سفارش (به همراه اسنپ‌شات محصول تا در صورت حذف فروشگاه/محصول، اطلاعات خرید باقی بماند)
             await db.execute(
                 """INSERT INTO orders
-                   (code_10, buyer_id, shop_id, product_id, price, courier_fee, status, product_title, product_desc, product_photo_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (code_10, buyer_id, shop_id, product_id, price, courier_fee, status, product_title, product_desc, product_photo_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (code_10, buyer_id, prod["shop_id"], product_id, price, courier_fee,
                  "DISPATCHED" if prod["needs_courier"] else "DELIVERED",
-                 prod["title"], prod["description"], prod["photo_id"])
+                 prod["title"], prod["description"], prod["photo_id"], datetime.now(timezone.utc).isoformat())
             )
             await db.commit()
 
@@ -2943,11 +5819,13 @@ async def cb_confirm_buy(callback: CallbackQuery):
         cost_line = f"💰 قیمت محصول: <code>₳ {price}</code>\n🚚 هزینه پست: <code>₳ {courier_fee}</code>\n💳 مجموع پرداختی: <code>₳ {total_cost}</code>\n"
     else:
         cost_line = f"💰 مبلغ پرداختی: <code>₳ {price}</code>\n"
+    escrow_note = "\n🧊 مبلغ فوق فریز شد و تا زمان تایید تحویل توسط پستچی، به کسی پرداخت نمی‌شود." if prod["needs_courier"] else ""
     msg_buyer = (
         f"🎉 خرید شما نهایی شد!\n"
         f"🛍 محصول: <b>{html.escape(prod['title'])}</b>\n"
         f"{cost_line}"
         f"🔐 کد امنیتی ۱۰ رقمی شما: <code>{code_10}</code>"
+        f"{escrow_note}"
     )
     try:
         await callback.message.edit_text(msg_buyer, parse_mode="HTML")
@@ -2957,7 +5835,8 @@ async def cb_confirm_buy(callback: CallbackQuery):
         except Exception:
             pass
 
-    msg_seller = f"🛍 سفارش جدید ثبت شد!\nمحصول: <b>{html.escape(prod['title'])}</b>\n🔐 کد امنیتی ۱۰ رقمی: <code>{code_10}</code>"
+    seller_escrow_note = "\n🧊 مبلغ این سفارش تا تایید تحویل توسط پستچی به حساب شما واریز نخواهد شد." if prod["needs_courier"] else ""
+    msg_seller = f"🛍 سفارش جدید ثبت شد!\nمحصول: <b>{html.escape(prod['title'])}</b>\n🔐 کد امنیتی ۱۰ رقمی: <code>{code_10}</code>{seller_escrow_note}"
     try:
         await callback.bot.send_message(shop_owner_id, msg_seller, parse_mode="HTML")
     except Exception:
@@ -2995,29 +5874,86 @@ async def cb_cancel_buy(callback: CallbackQuery):
 
 # --- ۴. دستورات پستچی‌ها (Couriers) ---
 
+COURIER_ORDERS_PAGE_SIZE = 10
+
+
+async def _is_courier_or_admin(user_id: int) -> bool:
+    if is_super_admin(user_id):
+        return True
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM couriers WHERE user_id = ?", (user_id,)) as cur:
+            return bool(await cur.fetchone())
+
+
+async def _fetch_dispatched_orders():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT o.*, s.channel_title AS shop_name, u.full_name AS buyer_name "
+            "FROM orders o LEFT JOIN shops s ON o.shop_id = s.shop_id "
+            "LEFT JOIN users u ON o.buyer_id = u.user_id "
+            "WHERE o.status = 'DISPATCHED' ORDER BY o.order_id ASC"
+        ) as cur_o:
+            return await cur_o.fetchall()
+
+
+def _render_courier_orders_page(orders, page: int):
+    total = len(orders)
+    total_pages = max(1, math.ceil(total / COURIER_ORDERS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * COURIER_ORDERS_PAGE_SIZE
+    page_items = orders[start:start + COURIER_ORDERS_PAGE_SIZE]
+
+    txt = f"🚚 <b>سفارش‌های آماده ارسال (مخصوص پستچی) (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"تعداد مرسولات معلق: <code>{total}</code> مورد\n\n"
+    for o in page_items:
+        safe_shop = html.escape(o["shop_name"] or "نامشخص")
+        safe_buyer = html.escape(o["buyer_name"] or "نامشخص")
+        safe_desc = html.escape(o["product_desc"] or "بدون توضیحات")
+        txt += (
+            f"🔹 کد: <code>{o['code_10']}</code> | فروشگاه: <b>{safe_shop}</b> | "
+            f"گیرنده: <b>{safe_buyer}</b> | توضیحات: {safe_desc}\n"
+        )
+
+    kb = _build_pagination_keyboard(page, total_pages, "courierorders_page")
+    return txt, kb
+
+
 @shop_router.message(Command("courier_orders"))
 async def cmd_courier_orders(message: Message):
     if not is_private(message):
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM couriers WHERE user_id = ?", (message.from_user.id,)) as cur:
-            if not await cur.fetchone() and not is_super_admin(message.from_user.id):
-                return await message.reply("❌ شما دسترسی پستچی ندارید.")
+    if not await _is_courier_or_admin(message.from_user.id):
+        return await message.reply("❌ شما دسترسی پستچی ندارید.")
 
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM orders WHERE status = 'DISPATCHED'"
-        ) as cur_o:
-            orders = await cur_o.fetchall()
-
+    orders = await _fetch_dispatched_orders()
     if not orders:
         return await message.reply("📦 هیچ سفارشی منتظر ارسال نیست.")
 
-    txt = "🚚 <b>سفارش‌های آماده ارسال:</b>\n\n"
-    for o in orders:
-        safe_title = html.escape(o['product_title'] or 'محصول حذف‌شده')
-        txt += f"📦 سفارش: <b>{safe_title}</b> | هزینه پست: <code>₳ {o['courier_fee']}</code> | کد: <code>{o['code_10']}</code>\n"
-    await message.reply(txt, parse_mode="HTML")
+    txt, kb = _render_courier_orders_page(orders, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
+
+
+@shop_router.callback_query(F.data == "courierorders_page_noop")
+async def cb_courier_orders_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@shop_router.callback_query(F.data.startswith("courierorders_page_"))
+async def cb_courier_orders_page(callback: CallbackQuery):
+    if not await _is_courier_or_admin(callback.from_user.id):
+        return await callback.answer("❌ شما دسترسی پستچی ندارید.", show_alert=True)
+
+    page = int(callback.data.split("_")[2])
+    orders = await _fetch_dispatched_orders()
+    if not orders:
+        return await callback.answer("📦 هیچ سفارشی منتظر ارسال نیست.", show_alert=True)
+    txt, kb = _render_courier_orders_page(orders, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
 
 
 @shop_router.message(Command("confirm_dispatch"))
@@ -3047,8 +5983,30 @@ async def cmd_confirm_dispatch(message: Message):
             if order["status"] == "DELIVERED":
                 return await message.reply("⚠️ این سفارش قبلاً تحویل داده شده است.")
 
+            if order["status"] == "CANCELLED":
+                return await message.reply("❌ این محصول توسط فروشنده حذف شده و دیگر در دسترس نیست. امکان تحویل این سفارش وجود ندارد.")
+
+            price = order["price"]
+            courier_fee = order["courier_fee"]
+            total_cost = price + courier_fee
+
             c_pct = await get_setting("courier_pct")
-            courier_share = int(order["courier_fee"] * (c_pct / 100.0))
+            s_pct = await get_setting("shop_seller_pct")
+            b_pct = await get_setting("shop_bank_pct")
+
+            seller_share = int(price * (s_pct / 100.0))
+            bank_share = int(price * (b_pct / 100.0))
+            courier_share = int(courier_fee * (c_pct / 100.0))
+            # باقی مانده درصد سوخت (امحا) می‌شود و به حسابی واریز نمی‌شود.
+
+            async with db.execute("SELECT owner_id FROM shops WHERE shop_id = ?", (order["shop_id"],)) as cur_s:
+                shop_row = await cur_s.fetchone()
+            shop_owner_id = shop_row["owner_id"] if shop_row else None
+
+            # 🏛 هزینه پست دریافتی از خریدار به‌عنوان درآمد سیستم به خزانه مرکزی واریز می‌شود
+            # (سهم پستچی بلافاصله از همین محل به او پرداخت خواهد شد)
+            if courier_fee > 0:
+                await treasury_credit(db, courier_fee, f"هزینه پست دریافتی سفارش {order['code_10']}", related_user=order["buyer_id"])
 
             # 🏛 پرداخت سهم پستچی از خزانه مرکزی (طبق قانون عدم خلق پول)
             paid = await treasury_debit(
@@ -3060,6 +6018,18 @@ async def cmd_confirm_dispatch(message: Message):
                     "❌ عدم امکان پرداخت به دلیل عدم کفایت موجودی خزانه. لطفاً بعداً دوباره تلاش کنید یا با سوپرادمین تماس بگیرید."
                 )
 
+            # 🔓 آزادسازی مبلغ فریزشده خریدار (balance او همان لحظه خرید کسر شده بود؛
+            # اینجا فقط ردیابی فریز پاک می‌شود، نه balance)
+            await db.execute(
+                "UPDATE users SET frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
+                (total_cost, order["buyer_id"])
+            )
+            # 💰 پرداخت سهم فروشنده (فقط الان، پس از تایید تحویل)
+            if shop_owner_id:
+                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (seller_share, shop_owner_id))
+            # 🏛 سهم بانک از فروش، به‌عنوان درآمد سیستم مستقیماً به خزانه مرکزی واریز می‌شود
+            await treasury_credit(db, bank_share, f"سهم بانک از فروش سفارش {order['code_10']}", related_user=shop_owner_id or 0)
+
             # واریز سهم خالص به پستچی و تغییر وضعیت سفارش
             await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (courier_share, courier_id))
             await db.execute("UPDATE orders SET status = 'DELIVERED', courier_id = ? WHERE order_id = ?", (courier_id, order["order_id"]))
@@ -3070,6 +6040,38 @@ async def cmd_confirm_dispatch(message: Message):
 
 # --- ۵. خریداران و عمومی ---
 
+MY_ORDERS_PAGE_SIZE = 10
+
+
+def _order_status_label(status: str) -> str:
+    if status == "DELIVERED":
+        return "🟢 تحویل شده"
+    elif status == "CANCELLED":
+        return "❌ این محصول توسط فروشنده حذف شده و دیگر در دسترس نیست"
+    return "🚚 در حال ارسال"
+
+
+def _render_my_orders_page(orders, page: int):
+    total = len(orders)
+    total_pages = max(1, math.ceil(total / MY_ORDERS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * MY_ORDERS_PAGE_SIZE
+    page_items = orders[start:start + MY_ORDERS_PAGE_SIZE]
+
+    txt = f"📦 <b>سفارش‌های من (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"تعداد کل سفارش‌ها: <code>{total}</code> عدد\n\n"
+    for o in page_items:
+        safe_title = html.escape(o["product_title"] or "محصول حذف‌شده")
+        st = _order_status_label(o["status"])
+        txt += (
+            f"🔹 کد: <code>{o['code_10']}</code> | {safe_title} | "
+            f"<code>₳ {o['price']}</code> | {st}\n"
+        )
+
+    kb = _build_pagination_keyboard(page, total_pages, "myorders_page")
+    return txt, kb
+
+
 @shop_router.message(Command("my_orders"))
 async def cmd_my_orders(message: Message):
     if not is_private(message):
@@ -3077,7 +6079,7 @@ async def cmd_my_orders(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM orders WHERE buyer_id = ?",
+            "SELECT * FROM orders WHERE buyer_id = ? ORDER BY order_id DESC",
             (message.from_user.id,)
         ) as cur:
             orders = await cur.fetchall()
@@ -3085,68 +6087,101 @@ async def cmd_my_orders(message: Message):
     if not orders:
         return await message.reply("🛍 شما هیچ سفارشی ثبت نکرده‌اید.")
 
-    txt = "🛍 <b>سفارش‌های من:</b>\n\n"
-    for o in orders:
-        st = "🟢 تحویل شده" if o["status"] == "DELIVERED" else "🚚 در حال ارسال"
-        safe_title = html.escape(o['product_title'] or 'محصول حذف‌شده')
-        txt += f"🔹 <b>{safe_title}</b> | کد: <code>{o['code_10']}</code> | وضعیت: {st}\n"
-    await message.reply(txt, parse_mode="HTML")
+    txt, kb = _render_my_orders_page(orders, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
+
+
+@shop_router.callback_query(F.data == "myorders_page_noop")
+async def cb_my_orders_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@shop_router.callback_query(F.data.startswith("myorders_page_"))
+async def cb_my_orders_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM orders WHERE buyer_id = ? ORDER BY order_id DESC",
+            (callback.from_user.id,)
+        ) as cur:
+            orders = await cur.fetchall()
+    if not orders:
+        return await callback.answer("🛍 سفارشی یافت نشد.", show_alert=True)
+    txt, kb = _render_my_orders_page(orders, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+MY_ASSETS_PAGE_SIZE = 10
+
+
+def _render_my_assets_page(orders, page: int):
+    total = len(orders)
+    total_pages = max(1, math.ceil(total / MY_ASSETS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * MY_ASSETS_PAGE_SIZE
+    page_items = orders[start:start + MY_ASSETS_PAGE_SIZE]
+
+    txt = f"🎁 <b>دارایی‌ها و محصولات خریداری‌شده (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"مجموع دارایی‌ها: <code>{total}</code> آیتم\n\n"
+    for o in page_items:
+        safe_title = html.escape(o["product_title"] or "محصول حذف‌شده")
+        received_at = o["created_at"][:10] if o["created_at"] else "نامشخص"
+        txt += (
+            f"🔹 <b>{safe_title}</b> | کد: <code>{o['code_10']}</code> | "
+            f"تاریخ دریافت: <code>{received_at}</code>\n"
+        )
+
+    kb = _build_pagination_keyboard(page, total_pages, "myassets_page")
+    return txt, kb
 
 
 @shop_router.message(Command("my_assets"))
 async def cmd_my_assets(message: Message):
     if not is_private(message):
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🖼 مشاهده محصولات خریداری‌شده", callback_data="show_my_assets")
-    ]])
-    await message.reply("📦 جهت مشاهده دارایی‌ها و محصولات خریداری‌شده خود کلیک کنید:", reply_markup=kb)
-
-
-@shop_router.callback_query(F.data == "show_my_assets")
-async def cb_show_my_assets(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM orders WHERE buyer_id = ? ORDER BY order_id",
-            (callback.from_user.id,)
+            "SELECT * FROM orders WHERE buyer_id = ? ORDER BY order_id DESC",
+            (message.from_user.id,)
         ) as cur:
             orders = await cur.fetchall()
 
     if not orders:
-        return await callback.answer("❌ هیچ دارایی/محصولی یافت نشد.", show_alert=True)
+        return await message.reply("❌ هیچ دارایی/محصولی یافت نشد.")
 
+    txt, kb = _render_my_assets_page(orders, 0)
+    await message.reply(txt, reply_markup=kb, parse_mode="HTML")
+
+
+@shop_router.callback_query(F.data == "myassets_page_noop")
+async def cb_my_assets_noop(callback: CallbackQuery):
     await callback.answer()
 
-    # گروه‌بندی خریدها بر اساس محصول تا آیتم‌های تکراری (خریدهای متعدد از کالای نامحدود) استک شوند
-    grouped = {}
-    order_of_keys = []
-    for o in orders:
-        key = o["product_id"]
-        if key not in grouped:
-            grouped[key] = {
-                "title": o["product_title"] or "محصول حذف‌شده",
-                "desc": o["product_desc"] or "",
-                "photo_id": o["product_photo_id"],
-                "count": 0,
-            }
-            order_of_keys.append(key)
-        grouped[key]["count"] += 1
 
-    for key in order_of_keys:
-        item = grouped[key]
-        safe_title = html.escape(item["title"])
-        safe_desc = html.escape(item["desc"])
-        # استک کردن آیتم‌های تکراری به شکل «نام محصول × تعداد»
-        title_line = f"{safe_title} × {item['count']}" if item["count"] > 1 else safe_title
-        caption = f"🖼 <b>{title_line}</b>\n\n📝 {safe_desc}"
-        try:
-            if item["photo_id"]:
-                await callback.bot.send_photo(chat_id=callback.from_user.id, photo=item["photo_id"], caption=caption, parse_mode="HTML")
-            else:
-                await callback.bot.send_message(chat_id=callback.from_user.id, text=caption, parse_mode="HTML")
-        except Exception:
-            pass
+@shop_router.callback_query(F.data.startswith("myassets_page_"))
+async def cb_my_assets_page(callback: CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM orders WHERE buyer_id = ? ORDER BY order_id DESC",
+            (callback.from_user.id,)
+        ) as cur:
+            orders = await cur.fetchall()
+    if not orders:
+        return await callback.answer("❌ هیچ دارایی/محصولی یافت نشد.", show_alert=True)
+    txt, kb = _render_my_assets_page(orders, page)
+    try:
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
 
 
 @shop_router.message(Command("track"))
@@ -3164,7 +6199,12 @@ async def cmd_track(message: Message):
     if not order:
         return await message.reply("❌ سفارشی با این کد ۱۰ رقمی پیدا نشد.")
 
-    st = "🟢 تحویل داده شده" if order["status"] == "DELIVERED" else "🚚 در حال ارسال توسط پستچی"
+    if order["status"] == "DELIVERED":
+        st = "🟢 تحویل داده شده"
+    elif order["status"] == "CANCELLED":
+        st = "❌ این محصول توسط فروشنده حذف شده و دیگر در دسترس نیست"
+    else:
+        st = "🚚 در حال ارسال توسط پستچی"
     safe_title = html.escape(order['product_title'] or 'محصول حذف‌شده')
     await message.reply(
         f"🔎 <b>پیگیری سفارش</b>\n\n"
@@ -3178,6 +6218,9 @@ async def cmd_track(message: Message):
 # =====================================================================================
 # 🏦 بخش ششم: بانک آترامنتوم (Atramentum Bank)
 # =====================================================================================
+# 📌 طبق الزامات جدید، تمام مراحل بانک (واریز/برداشت/بازگشت به صفحه اصلی) فقط با ویرایش
+# همان پیام اولیه بانک (Edit Message) انجام می‌شود و هیچ پیام جدیدی ارسال نمی‌گردد.
+# پیام ریپلای کاربر نیز پس از پردازش حذف می‌شود تا محیط گفتگو مرتب بماند.
 
 def _bank_panel_text(u) -> str:
     total_after_profit = u["bank_savings"] + u["last_daily_profit"]
@@ -3194,6 +6237,84 @@ def _bank_buttons() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📥 واریز پول", callback_data="bank_deposit"),
         InlineKeyboardButton(text="📤 برداشت پول", callback_data="bank_withdraw"),
     ]])
+
+
+def _bank_full_text(u) -> str:
+    transferable = max(0, u["balance"] - u["frozen_balance"])
+    return (
+        "🏦 <b>حساب بانکی آترامنتوم شما</b>\n\n"
+        f"💰 موجودی کل کیف پول: <code>₳ {u['balance']}</code>\n"
+        f"🔒 موجودی وثیقه قفل‌شده: <code>₳ {u['frozen_balance']}</code>\n"
+        f"💳 موجودی قابل انتقال: <code>₳ {transferable}</code>\n\n"
+        f"🏦 سپرده بانکی فعلی: <code>₳ {u['bank_savings']}</code>\n"
+        f"📈 آخرین سود روزانه دریافتی: <code>₳ {u['last_daily_profit']}</code>"
+    )
+
+
+def _bank_full_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📥 واریز پول", callback_data="bank_deposit"),
+            InlineKeyboardButton(text="📤 برداشت پول", callback_data="bank_withdraw"),
+        ],
+        [InlineKeyboardButton(text="💳 وام‌های آترامنتوم", callback_data="loan_menu")],
+        [InlineKeyboardButton(text="⚙️ مدیریت حساب بانکی", callback_data="bank_manage")],
+    ])
+
+
+def _bank_deposit_prompt_text() -> str:
+    return (
+        "📥 <b>واریز به بانک آترامنتوم</b>\n\n"
+        "لطفاً مبلغ موردنظر برای واریز را با ریپلای روی همین پیام ارسال کنید.\n"
+        "⚠️ فقط تا سقف موجودی قابل انتقال شما (موجودی منهای وثیقه قفل‌شده) قابل واریز است "
+        f"و سقف کل سپرده بانکی ₳{BANK_SAVINGS_CAP} است."
+    )
+
+
+def _bank_withdraw_prompt_text() -> str:
+    return (
+        "📤 <b>برداشت از بانک آترامنتوم</b>\n\n"
+        "لطفاً مبلغ موردنظر برای برداشت را با ریپلای روی همین پیام ارسال کنید."
+    )
+
+
+def _bank_detect_panel_type(message: Message) -> str:
+    """نوع پنل بانکی (کامل یا سریع) را از روی تعداد ردیف‌های دکمه پیام فعلی تشخیص می‌دهد."""
+    try:
+        rows = message.reply_markup.inline_keyboard
+        return "full" if len(rows) > 1 else "panel"
+    except Exception:
+        return "panel"
+
+
+async def _bank_render(user_id: int, panel_type: str):
+    """متن و کیبورد صفحه اصلی بانک را بر اساس نوع پنل و موجودی به‌روز کاربر می‌سازد."""
+    u = await get_user_data(user_id)
+    if not u:
+        return None
+    if panel_type == "full":
+        return _bank_full_text(u), _bank_full_buttons()
+    return _bank_panel_text(u), _bank_buttons()
+
+
+async def _bank_edit_main(bot: Bot, chat_id: int, message_id: int, user_id: int, panel_type: str, note: str = "") -> None:
+    """پیام اصلی بانک را ویرایش کرده و به صفحه اصلی (با موجودی جدید) بازمی‌گرداند."""
+    if not message_id:
+        return
+    rendered = await _bank_render(user_id, panel_type)
+    if not rendered:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="❌ حساب شما یافت نشد.")
+        except Exception:
+            pass
+        return
+    text, kb = rendered
+    if note:
+        text = f"{note}\n\n{text}"
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
 
 
 @user_router.message(F.text == "بانک آترامنتوم")
@@ -3216,27 +6337,10 @@ async def cmd_bank_full(message: Message):
         return
     user_id = message.from_user.id
     await sync_user(user_id, message.from_user.username, message.from_user.full_name)
-    u = await get_user_data(user_id)
-    if not u:
+    rendered = await _bank_render(user_id, "full")
+    if not rendered:
         return await message.reply("❌ حساب شما یافت نشد.")
-
-    transferable = max(0, u["balance"] - u["frozen_balance"])
-    text = (
-        "🏦 <b>حساب بانکی آترامنتوم شما</b>\n\n"
-        f"💰 موجودی کل کیف پول: <code>₳ {u['balance']}</code>\n"
-        f"🔒 موجودی وثیقه قفل‌شده: <code>₳ {u['frozen_balance']}</code>\n"
-        f"💳 موجودی قابل انتقال: <code>₳ {transferable}</code>\n\n"
-        f"🏦 سپرده بانکی فعلی: <code>₳ {u['bank_savings']}</code>\n"
-        f"📈 آخرین سود روزانه دریافتی: <code>₳ {u['last_daily_profit']}</code>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📥 واریز پول", callback_data="bank_deposit"),
-            InlineKeyboardButton(text="📤 برداشت پول", callback_data="bank_withdraw"),
-        ],
-        [InlineKeyboardButton(text="💳 وام‌های آترامنتوم", callback_data="loan_menu")],
-        [InlineKeyboardButton(text="⚙️ مدیریت حساب بانکی", callback_data="bank_manage")],
-    ])
+    text, kb = rendered
     await message.reply(text, reply_markup=kb, parse_mode="HTML")
 
 
@@ -3250,46 +6354,95 @@ async def cb_bank_manage(callback: CallbackQuery):
 
 @user_router.callback_query(F.data == "bank_deposit")
 async def cb_bank_deposit(callback: CallbackQuery, state: FSMContext):
-    prompt = await callback.message.answer(
-        "📥 <b>واریز به بانک آترامنتوم</b>\n\n"
-        "لطفاً مبلغ مورد نظر برای واریز را با <b>ریپلای روی همین پیام</b> ارسال کنید.\n"
-        "⚠️ فقط تا سقف «موجودی قابل انتقال» شما (موجودی منهای وثیقه قفل‌شده) قابل واریز است "
-        f"و سقف کل سپرده بانکی <code>₳ {BANK_SAVINGS_CAP}</code> است.",
-        parse_mode="HTML",
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    message_id = callback.message.message_id
+    panel_type = _bank_detect_panel_type(callback.message)
+
+    try:
+        await callback.message.edit_text(_bank_deposit_prompt_text(), parse_mode="HTML")
+    except Exception:
+        pass
+
+    await state.update_data(
+        bank_user=user_id, bank_chat_id=chat_id, bank_msg_id=message_id, bank_panel_type=panel_type,
     )
-    await state.update_data(bank_user=callback.from_user.id, bank_prompt_id=prompt.message_id)
     await state.set_state(BankForm.waiting_for_deposit_amount)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, chat_id, user_id, current_state,
+        lambda: _bank_edit_main(
+            callback.bot, chat_id, message_id, user_id, panel_type,
+            note="⏳ عملیات واریز به دلیل عدم دریافت پاسخ در بازه ۱ دقیقه به‌صورت خودکار لغو شد.",
+        ),
+    )
     await callback.answer()
 
 
 @user_router.callback_query(F.data == "bank_withdraw")
 async def cb_bank_withdraw(callback: CallbackQuery, state: FSMContext):
-    prompt = await callback.message.answer(
-        "📤 <b>برداشت از بانک آترامنتوم</b>\n\n"
-        "لطفاً مبلغ مورد نظر برای برداشت را با <b>ریپلای روی همین پیام</b> ارسال کنید.",
-        parse_mode="HTML",
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    message_id = callback.message.message_id
+    panel_type = _bank_detect_panel_type(callback.message)
+
+    try:
+        await callback.message.edit_text(_bank_withdraw_prompt_text(), parse_mode="HTML")
+    except Exception:
+        pass
+
+    await state.update_data(
+        bank_user=user_id, bank_chat_id=chat_id, bank_msg_id=message_id, bank_panel_type=panel_type,
     )
-    await state.update_data(bank_user=callback.from_user.id, bank_prompt_id=prompt.message_id)
     await state.set_state(BankForm.waiting_for_withdraw_amount)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, chat_id, user_id, current_state,
+        lambda: _bank_edit_main(
+            callback.bot, chat_id, message_id, user_id, panel_type,
+            note="⏳ عملیات برداشت به دلیل عدم دریافت پاسخ در بازه ۱ دقیقه به‌صورت خودکار لغو شد.",
+        ),
+    )
     await callback.answer()
 
 
 @user_router.message(BankForm.waiting_for_deposit_amount)
 async def process_bank_deposit(message: Message, state: FSMContext):
     data = await state.get_data()
-    if message.from_user.id != data.get("bank_user"):
+    user_id = message.from_user.id
+    if user_id != data.get("bank_user"):
         return
-    if not message.reply_to_message or message.reply_to_message.message_id != data.get("bank_prompt_id"):
-        return await message.reply("⚠️ لطفاً روی پیام راهنمای بانک ریپلای کرده و مبلغ عددی را ارسال کنید.")
+    chat_id = data.get("bank_chat_id", message.chat.id)
+    bank_msg_id = data.get("bank_msg_id")
+    panel_type = data.get("bank_panel_type", "panel")
+
+    if not message.reply_to_message or message.reply_to_message.message_id != bank_msg_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=chat_id, message_id=bank_msg_id,
+                text="⚠️ لطفاً روی همین پیام ریپلای کرده و مبلغ عددی را ارسال کنید.\n\n" + _bank_deposit_prompt_text(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    cancel_input_timeout(chat_id, user_id)
+
+    async def _fail(note_text: str):
+        await state.clear()
+        await _bank_edit_main(message.bot, chat_id, bank_msg_id, user_id, panel_type, note=note_text)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
     try:
         amount = int(message.text.strip())
     except (ValueError, AttributeError):
-        return await message.reply("❌ مبلغ وارد شده نامعتبر است. لطفاً یک عدد صحیح ارسال کنید.")
+        return await _fail("❌ مبلغ وارد شده نامعتبر است. برای تلاش مجدد، دوباره از منوی بانک اقدام کنید.")
     if amount <= 0:
-        return await message.reply("❌ مبلغ باید مثبت باشد.")
-
-    await state.clear()
-    user_id = message.from_user.id
+        return await _fail("❌ مبلغ باید مثبت باشد. برای تلاش مجدد، دوباره از منوی بانک اقدام کنید.")
 
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -3300,20 +6453,18 @@ async def process_bank_deposit(message: Message, state: FSMContext):
             ) as cur:
                 u = await cur.fetchone()
             if not u or u["is_frozen"]:
-                return await message.reply("❌ حساب شما مسدود (فریز) است.")
+                return await _fail("❌ حساب شما مسدود (فریز) است.")
 
             transferable = max(0, u["balance"] - u["frozen_balance"])
             if amount > transferable:
-                return await message.reply(
-                    f"❌ حداکثر مبلغ قابل واریز شما (موجودی قابل انتقال): <code>₳ {transferable}</code>",
-                    parse_mode="HTML",
+                return await _fail(
+                    f"❌ حداکثر مبلغ قابل واریز شما (موجودی قابل انتقال): <code>₳ {transferable}</code>"
                 )
             remaining_cap = max(0, BANK_SAVINGS_CAP - u["bank_savings"])
             if amount > remaining_cap:
-                return await message.reply(
+                return await _fail(
                     f"❌ سقف سپرده‌گذاری بانک <code>₳ {BANK_SAVINGS_CAP}</code> است.\n"
-                    f"سقف باقیمانده قابل واریز شما: <code>₳ {remaining_cap}</code>",
-                    parse_mode="HTML",
+                    f"سقف باقیمانده قابل واریز شما: <code>₳ {remaining_cap}</code>"
                 )
 
             await db.execute(
@@ -3322,25 +6473,54 @@ async def process_bank_deposit(message: Message, state: FSMContext):
             )
             await db.commit()
 
-    await message.reply(f"✅ مبلغ <code>₳ {amount}</code> با موفقیت به حساب بانکی شما واریز شد.", parse_mode="HTML")
+    await state.clear()
+    await _bank_edit_main(
+        message.bot, chat_id, bank_msg_id, user_id, panel_type,
+        note=f"✅ مبلغ <code>₳ {amount}</code> با موفقیت به حساب بانکی شما واریز شد.",
+    )
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 @user_router.message(BankForm.waiting_for_withdraw_amount)
 async def process_bank_withdraw(message: Message, state: FSMContext):
     data = await state.get_data()
-    if message.from_user.id != data.get("bank_user"):
+    user_id = message.from_user.id
+    if user_id != data.get("bank_user"):
         return
-    if not message.reply_to_message or message.reply_to_message.message_id != data.get("bank_prompt_id"):
-        return await message.reply("⚠️ لطفاً روی پیام راهنمای بانک ریپلای کرده و مبلغ عددی را ارسال کنید.")
+    chat_id = data.get("bank_chat_id", message.chat.id)
+    bank_msg_id = data.get("bank_msg_id")
+    panel_type = data.get("bank_panel_type", "panel")
+
+    if not message.reply_to_message or message.reply_to_message.message_id != bank_msg_id:
+        try:
+            await message.bot.edit_message_text(
+                chat_id=chat_id, message_id=bank_msg_id,
+                text="⚠️ لطفاً روی همین پیام ریپلای کرده و مبلغ عددی را ارسال کنید.\n\n" + _bank_withdraw_prompt_text(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    cancel_input_timeout(chat_id, user_id)
+
+    async def _fail(note_text: str):
+        await state.clear()
+        await _bank_edit_main(message.bot, chat_id, bank_msg_id, user_id, panel_type, note=note_text)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
     try:
         amount = int(message.text.strip())
     except (ValueError, AttributeError):
-        return await message.reply("❌ مبلغ وارد شده نامعتبر است. لطفاً یک عدد صحیح ارسال کنید.")
+        return await _fail("❌ مبلغ وارد شده نامعتبر است. برای تلاش مجدد، دوباره از منوی بانک اقدام کنید.")
     if amount <= 0:
-        return await message.reply("❌ مبلغ باید مثبت باشد.")
-
-    await state.clear()
-    user_id = message.from_user.id
+        return await _fail("❌ مبلغ باید مثبت باشد. برای تلاش مجدد، دوباره از منوی بانک اقدام کنید.")
 
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -3350,11 +6530,10 @@ async def process_bank_withdraw(message: Message, state: FSMContext):
             ) as cur:
                 u = await cur.fetchone()
             if not u or u["is_frozen"]:
-                return await message.reply("❌ حساب شما مسدود (فریز) است.")
+                return await _fail("❌ حساب شما مسدود (فریز) است.")
             if amount > u["bank_savings"]:
-                return await message.reply(
-                    f"❌ موجودی بانکی شما کافی نیست. سپرده فعلی: <code>₳ {u['bank_savings']}</code>",
-                    parse_mode="HTML",
+                return await _fail(
+                    f"❌ موجودی بانکی شما کافی نیست. سپرده فعلی: <code>₳ {u['bank_savings']}</code>"
                 )
 
             await db.execute(
@@ -3363,7 +6542,15 @@ async def process_bank_withdraw(message: Message, state: FSMContext):
             )
             await db.commit()
 
-    await message.reply(f"✅ مبلغ <code>₳ {amount}</code> با موفقیت از بانک به کیف پول شما برداشت شد.", parse_mode="HTML")
+    await state.clear()
+    await _bank_edit_main(
+        message.bot, chat_id, bank_msg_id, user_id, panel_type,
+        note=f"✅ مبلغ <code>₳ {amount}</code> با موفقیت از بانک به کیف پول شما برداشت شد.",
+    )
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 # --- ⏰ پردازش خودکار شبانه سود بانک (ساعت ۰۰:۰۰ به وقت ایران) ---
@@ -3449,6 +6636,8 @@ async def _get_loan_settings() -> dict:
     keys = [
         "min_loan_amount", "max_loan_amount", "min_loan_interest", "max_loan_interest",
         "allowed_installments", "collateral_rate", "required_balance_rate", "late_penalty_rate",
+        "loan_guarantor_balance_rate_borrower", "loan_guarantor_balance_rate_guarantor",
+        "loan_guarantor_collateral_rate_borrower", "loan_guarantor_collateral_rate_guarantor",
     ]
     result = {}
     for k in keys:
@@ -3470,6 +6659,11 @@ def _compute_dynamic_interest(amount: int, settings: dict) -> float:
 
 
 async def _create_loan_installments(db, loan_id: int, total_repayment: int, count: int, created_at: datetime):
+    """
+    اقساط وام را با فاصله دقیق ۱۰ روز از یکدیگر می‌سازد: قسط اول ۱۰ روز پس از لحظه
+    واریز موفق وام (created_at)، و هر قسط بعدی = سررسید قسط قبلی + ۱۰ روز.
+    این تابع برای هر دو نوع وام (COLLATERAL و GUARANTOR) به‌طور یکسان استفاده می‌شود.
+    """
     base_each = total_repayment // count
     remainder = total_repayment - (base_each * count)
     for i in range(1, count + 1):
@@ -3485,7 +6679,10 @@ async def _create_loan_installments(db, loan_id: int, total_repayment: int, coun
         )
 
 
-def _loan_summary_text(target_data, amount: int, interest: float, installments: int, total_repayment: int, loan_type: str, collateral_amount: int = 0) -> str:
+def _loan_summary_text(
+    target_data, amount: int, interest: float, installments: int, total_repayment: int, loan_type: str,
+    collateral_amount: int = 0, borrower_collateral: int = 0, guarantor_collateral: int = 0,
+) -> str:
     safe_name = html.escape(target_data["full_name"] or "ناشناس")
     type_label = "🔒 وثیقه‌ای" if loan_type == "COLLATERAL" else "🤝 ضامنی"
     lines = [
@@ -3499,6 +6696,9 @@ def _loan_summary_text(target_data, amount: int, interest: float, installments: 
     ]
     if loan_type == "COLLATERAL":
         lines.append(f"🔒 مبلغ وثیقه قفل‌شده: <code>₳ {collateral_amount}</code>")
+    else:
+        lines.append(f"🔒 وثیقه گیرنده: <code>₳ {borrower_collateral}</code>")
+        lines.append(f"🔒 وثیقه ضامن: <code>₳ {guarantor_collateral}</code>")
     return "\n".join(lines)
 
 
@@ -3509,9 +6709,24 @@ async def cmd_loan_start(message: Message, state: FSMContext):
         return
     user_id = message.from_user.id
     await sync_user(user_id, message.from_user.username, message.from_user.full_name)
+
+    # 🚫 هر کاربر همزمان فقط یک درخواست وام در حال بررسی (Pending) می‌تواند داشته باشد
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM loans WHERE user_id = ? AND status IN ('PENDING_ADMIN', 'PENDING_GUARANTOR', 'PENDING_GUARANTOR_FINAL') LIMIT 1",
+            (user_id,),
+        ) as cur:
+            has_pending = await cur.fetchone()
+    if has_pending:
+        return await message.reply(
+            "❌ شما در حال حاضر یک درخواست وام در حال بررسی دارید. تا زمان تأیید/رد یا لغو آن، امکان ثبت درخواست جدید وجود ندارد.\n"
+            "برای مشاهده و لغو درخواست فعلی: <code>/my_loans</code>",
+            parse_mode="HTML",
+        )
+
     settings = await _get_loan_settings()
     await state.update_data(loan_settings=settings)
-    await message.reply(
+    prompt = await message.reply(
         "💳 <b>درخواست وام آترامنتوم</b>\n\n"
         f"💰 مبلغ وام باید بین <code>₳ {int(settings['min_loan_amount'])}</code> "
         f"تا <code>₳ {int(settings['max_loan_amount'])}</code> باشد.\n\n"
@@ -3519,6 +6734,11 @@ async def cmd_loan_start(message: Message, state: FSMContext):
         parse_mode="HTML",
     )
     await state.set_state(LoanForm.waiting_for_amount)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, user_id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
 
 
 @user_router.callback_query(F.data == "loan_menu")
@@ -3536,9 +6756,24 @@ async def cb_loan_menu(callback: CallbackQuery, state: FSMContext):
 
 @user_router.callback_query(F.data == "loan_new_request")
 async def cb_loan_new_request(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+
+    # 🚫 هر کاربر همزمان فقط یک درخواست وام در حال بررسی (Pending) می‌تواند داشته باشد
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM loans WHERE user_id = ? AND status IN ('PENDING_ADMIN', 'PENDING_GUARANTOR', 'PENDING_GUARANTOR_FINAL') LIMIT 1",
+            (user_id,),
+        ) as cur:
+            has_pending = await cur.fetchone()
+    if has_pending:
+        return await callback.answer(
+            "❌ شما در حال حاضر یک درخواست وام در حال بررسی دارید. تا زمان تأیید/رد یا لغو آن، امکان ثبت درخواست جدید وجود ندارد.",
+            show_alert=True,
+        )
+
     settings = await _get_loan_settings()
     await state.update_data(loan_settings=settings)
-    await callback.message.answer(
+    prompt = await callback.message.answer(
         "💳 <b>درخواست وام آترامنتوم</b>\n\n"
         f"💰 مبلغ وام باید بین <code>₳ {int(settings['min_loan_amount'])}</code> "
         f"تا <code>₳ {int(settings['max_loan_amount'])}</code> باشد.\n\n"
@@ -3546,25 +6781,41 @@ async def cb_loan_new_request(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await state.set_state(LoanForm.waiting_for_amount)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, callback.from_user.id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, prompt.message_id),
+    )
     await callback.answer()
 
 
 @user_router.message(LoanForm.waiting_for_amount)
 async def loan_process_amount(message: Message, state: FSMContext):
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     data = await state.get_data()
     settings = data.get("loan_settings") or await _get_loan_settings()
+
+    def _reschedule():
+        current_state = LoanForm.waiting_for_amount.state
+        schedule_input_timeout(
+            state, message.chat.id, message.from_user.id, current_state,
+            lambda: _default_timeout_notice(message.bot, message.chat.id, None),
+        )
+
     try:
         amount = int(message.text.strip())
     except (ValueError, AttributeError):
-        return await message.reply("❌ لطفاً یک عدد صحیح ارسال کنید.")
+        await message.reply("❌ لطفاً یک عدد صحیح ارسال کنید.")
+        return _reschedule()
 
     min_amt = int(settings["min_loan_amount"])
     max_amt = int(settings["max_loan_amount"])
     if amount < min_amt or amount > max_amt:
-        return await message.reply(
+        await message.reply(
             f"❌ مبلغ وام باید بین <code>₳ {min_amt}</code> تا <code>₳ {max_amt}</code> باشد.",
             parse_mode="HTML",
         )
+        return _reschedule()
 
     allowed_raw = str(settings.get("allowed_installments") or "2,3")
     allowed_list = [p.strip() for p in allowed_raw.split(",") if p.strip()]
@@ -3573,15 +6824,21 @@ async def loan_process_amount(message: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"{n} قسط", callback_data=f"loan_inst_{n}") for n in allowed_list
     ]])
-    await message.reply(
+    prompt = await message.reply(
         f"🔢 تعداد اقساط مورد نظر خود را انتخاب کنید (مجاز: {allowed_raw}):",
         reply_markup=kb,
     )
     await state.set_state(LoanForm.waiting_for_installments)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, message.from_user.id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
 
 
 @user_router.callback_query(LoanForm.waiting_for_installments, F.data.startswith("loan_inst_"))
 async def loan_process_installments(callback: CallbackQuery, state: FSMContext):
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
     installments = int(callback.data.split("_")[2])
     await state.update_data(loan_installments=installments)
 
@@ -3600,6 +6857,11 @@ async def loan_process_installments(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     await state.set_state(LoanForm.waiting_for_method)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, callback.from_user.id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
     await callback.answer()
 
 
@@ -3612,18 +6874,28 @@ async def _send_loan_request_to_admins(bot: Bot, loan_id: int):
 
     treasury_balance = await get_treasury_balance()
     collateral_amount = 0
+    borrower_collateral = 0
+    guarantor_collateral = 0
     if loan["loan_type"] == "COLLATERAL":
-        settings = await _get_loan_settings()
-        collateral_amount = int(loan["total_amount"] * float(settings["collateral_rate"]))
+        collateral_amount = loan["collateral_amount"] or 0
+    else:
+        borrower_collateral = loan["borrower_collateral_amount"] or 0
+        guarantor_collateral = loan["guarantor_collateral_amount"] or 0
 
     summary = _loan_summary_text(
         target_data, loan["total_amount"], loan["interest_rate"], loan["installments_count"],
-        loan["total_repayment"], loan["loan_type"], collateral_amount
+        loan["total_repayment"], loan["loan_type"], collateral_amount, borrower_collateral, guarantor_collateral
     )
+    collateral_note = ""
+    if loan["loan_type"] == "COLLATERAL":
+        collateral_note = "\n⚠️ وثیقه هنوز قفل نشده و فقط با تأیید شما قفل خواهد شد."
+    else:
+        collateral_note = "\n⚠️ وثیقه‌های گیرنده و ضامن هنوز قفل نشده‌اند و فقط با تأیید شما قفل خواهند شد."
     text = (
         "💳 <b>درخواست وام جدید</b>\n\n"
         f"{summary}\n\n"
         f"🏛 موجودی فعلی خزانه: <code>₳ {treasury_balance}</code>"
+        f"{collateral_note}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🟢 تأیید و واریز وام", callback_data=f"loan_admin_approve_{loan_id}"),
@@ -3638,6 +6910,7 @@ async def _send_loan_request_to_admins(bot: Bot, loan_id: int):
 
 @user_router.callback_query(LoanForm.waiting_for_method, F.data == "loan_method_collateral")
 async def loan_method_collateral(callback: CallbackQuery, state: FSMContext):
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
     data = await state.get_data()
     settings = data.get("loan_settings") or await _get_loan_settings()
     amount = data["loan_amount"]
@@ -3672,25 +6945,27 @@ async def loan_method_collateral(callback: CallbackQuery, state: FSMContext):
             if transferable < collateral_amount:
                 await state.clear()
                 return await callback.message.edit_text(
-                    f"❌ موجودی آزاد شما برای قفل‌کردن وثیقه <code>₳ {collateral_amount}</code> کافی نیست.",
+                    f"❌ موجودی آزاد شما برای وثیقه <code>₳ {collateral_amount}</code> این وام کافی نیست.",
                     parse_mode="HTML",
                 )
 
             interest = _compute_dynamic_interest(amount, settings)
             total_repayment = amount + int(amount * (interest / 100.0))
 
-            await db.execute(
-                "UPDATE users SET frozen_balance = frozen_balance + ? WHERE user_id = ?",
-                (collateral_amount, user_id),
-            )
+            # ⚠️ طبق سیستم جدید وثیقه، در لحظه ثبت درخواست هیچ مبلغی قفل نمی‌شود.
+            # مبلغ وثیقه صرفاً محاسبه و روی خود وام ذخیره می‌شود؛ قفل واقعی (frozen_balance)
+            # فقط در لحظه تأیید نهایی سوپرادمین انجام خواهد شد.
             cur2 = await db.execute(
                 """
                 INSERT INTO loans
                 (user_id, guarantor_id, total_amount, interest_rate, total_repayment,
-                 installments_count, status, loan_type, created_at)
-                VALUES (?, 0, ?, ?, ?, ?, 'PENDING_ADMIN', 'COLLATERAL', ?)
+                 installments_count, status, loan_type, created_at, collateral_amount)
+                VALUES (?, 0, ?, ?, ?, ?, 'PENDING_ADMIN', 'COLLATERAL', ?, ?)
                 """,
-                (user_id, amount, interest, total_repayment, installments, datetime.now(timezone.utc).isoformat()),
+                (
+                    user_id, amount, interest, total_repayment, installments,
+                    datetime.now(timezone.utc).isoformat(), collateral_amount,
+                ),
             )
             loan_id = cur2.lastrowid
             await db.commit()
@@ -3699,7 +6974,8 @@ async def loan_method_collateral(callback: CallbackQuery, state: FSMContext):
     try:
         await callback.message.edit_text(
             "✅ درخواست وام وثیقه‌ای شما ثبت شد و برای بررسی نهایی برای سوپرادمین ارسال گردید.\n"
-            f"🔒 مبلغ <code>₳ {collateral_amount}</code> به‌عنوان وثیقه در حساب شما قفل شد.",
+            f"🔒 در صورت تأیید سوپرادمین، مبلغ <code>₳ {collateral_amount}</code> به‌عنوان وثیقه از موجودی "
+            f"قابل‌انتقال شما کسر و قفل خواهد شد.",
             parse_mode="HTML",
         )
     except Exception:
@@ -3711,6 +6987,7 @@ async def loan_method_collateral(callback: CallbackQuery, state: FSMContext):
 
 @user_router.callback_query(LoanForm.waiting_for_method, F.data == "loan_method_guarantor")
 async def loan_method_guarantor(callback: CallbackQuery, state: FSMContext):
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
     try:
         await callback.message.edit_text(
             "🤝 لطفاً آیدی عددی (شماره حساب) ضامن خود را ارسال کنید، یا روی پیام او در ربات ریپلای کرده و آیدی را بنویسید."
@@ -3718,13 +6995,26 @@ async def loan_method_guarantor(callback: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     await state.set_state(LoanForm.waiting_for_guarantor)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, callback.message.chat.id, callback.from_user.id, current_state,
+        lambda: _default_timeout_notice(callback.bot, callback.message.chat.id, callback.message.message_id),
+    )
     await callback.answer()
 
 
 @user_router.message(LoanForm.waiting_for_guarantor)
 async def loan_process_guarantor(message: Message, state: FSMContext):
+    cancel_input_timeout(message.chat.id, message.from_user.id)
     data = await state.get_data()
     user_id = message.from_user.id
+
+    def _reschedule():
+        current_state = LoanForm.waiting_for_guarantor.state
+        schedule_input_timeout(
+            state, message.chat.id, user_id, current_state,
+            lambda: _default_timeout_notice(message.bot, message.chat.id, None),
+        )
 
     guarantor_id = None
     if message.reply_to_message and message.reply_to_message.from_user:
@@ -3733,16 +7023,35 @@ async def loan_process_guarantor(message: Message, state: FSMContext):
         try:
             guarantor_id = int(message.text.strip())
         except (ValueError, AttributeError):
-            return await message.reply("❌ آیدی عددی نامعتبر است.")
+            await message.reply("❌ آیدی عددی نامعتبر است.")
+            return _reschedule()
 
     if guarantor_id == user_id:
-        return await message.reply("❌ شما نمی‌توانید ضامن خودتان باشید.")
+        await message.reply("❌ شما نمی‌توانید ضامن خودتان باشید.")
+        return _reschedule()
 
     guarantor_data = await get_user_data(guarantor_id)
     if not guarantor_data:
-        return await message.reply("❌ کاربری با این آیدی در ربات یافت نشد.")
+        await message.reply("❌ کاربری با این آیدی در ربات یافت نشد.")
+        return _reschedule()
     if guarantor_data["is_frozen"]:
-        return await message.reply("❌ حساب ضامن انتخابی مسدود (فریز) است.")
+        await message.reply("❌ حساب ضامن انتخابی مسدود (فریز) است.")
+        return _reschedule()
+
+    # 🚫 هر کاربر همزمان فقط یک درخواست وام در حال بررسی (Pending) می‌تواند داشته باشد
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM loans WHERE user_id = ? AND status IN ('PENDING_ADMIN', 'PENDING_GUARANTOR', 'PENDING_GUARANTOR_FINAL') LIMIT 1",
+            (user_id,),
+        ) as cur:
+            has_pending = await cur.fetchone()
+    if has_pending:
+        await state.clear()
+        return await message.reply(
+            "❌ شما در حال حاضر یک درخواست وام در حال بررسی دارید. تا زمان تأیید/رد یا لغو آن، امکان ثبت درخواست جدید وجود ندارد.\n"
+            "برای مشاهده و لغو درخواست فعلی: <code>/my_loans</code>",
+            parse_mode="HTML",
+        )
 
     settings = data.get("loan_settings") or await _get_loan_settings()
     amount = data["loan_amount"]
@@ -3750,16 +7059,138 @@ async def loan_process_guarantor(message: Message, state: FSMContext):
     interest = _compute_dynamic_interest(amount, settings)
     total_repayment = amount + int(amount * (interest / 100.0))
 
+    # 🤝 نرخ‌های تمکن (موجودی آزاد لازم) و وثیقه برای هر دو طرف وام ضامنی
+    balance_rate_borrower = float(settings.get("loan_guarantor_balance_rate_borrower") or 0.20)
+    balance_rate_guarantor = float(settings.get("loan_guarantor_balance_rate_guarantor") or 0.20)
+    collateral_rate_borrower = float(settings.get("loan_guarantor_collateral_rate_borrower") or 0.08)
+    collateral_rate_guarantor = float(settings.get("loan_guarantor_collateral_rate_guarantor") or 0.09)
+
+    required_balance_borrower = int(amount * balance_rate_borrower)
+    required_balance_guarantor = int(amount * balance_rate_guarantor)
+    borrower_collateral = int(amount * collateral_rate_borrower)
+    guarantor_collateral = int(amount * collateral_rate_guarantor)
+
+    # ✅ اعتبارسنجی تمکن گیرنده (حداقل نرخ تنظیم‌شده از موجودی آزاد فعلی او)
+    borrower_data = await get_user_data(user_id)
+    if not borrower_data or borrower_data["is_frozen"]:
+        await state.clear()
+        return await message.reply("❌ حساب شما مسدود (فریز) است.")
+    borrower_transferable = max(0, borrower_data["balance"] - borrower_data["frozen_balance"])
+    if borrower_transferable < required_balance_borrower:
+        await message.reply(
+            f"❌ برای این وام باید حداقل <code>₳ {required_balance_borrower}</code> در موجودی آزاد خود داشته باشید.\n"
+            f"موجودی آزاد فعلی شما: <code>₳ {borrower_transferable}</code>",
+            parse_mode="HTML",
+        )
+        return _reschedule()
+
+    # ✅ اعتبارسنجی تمکن ضامن (حداقل نرخ تنظیم‌شده از موجودی آزاد فعلی او)
+    guarantor_transferable = max(0, guarantor_data["balance"] - guarantor_data["frozen_balance"])
+    if guarantor_transferable < required_balance_guarantor:
+        await message.reply(
+            f"❌ موجودی آزاد ضامن انتخابی برای ضمانت این وام کافی نیست.\n"
+            f"موجودی آزاد لازم برای ضامن: <code>₳ {required_balance_guarantor}</code>",
+            parse_mode="HTML",
+        )
+        return _reschedule()
+
+    # ⚠️ طبق سیستم جدید، در این مرحله هیچ ثبت یا تغییر مالی‌ای انجام نمی‌شود؛ فقط وثیقه‌ها
+    # محاسبه و در State ذخیره می‌شوند تا پس از تأیید نهایی کاربر در صفحه پیش‌نمایش، وام ثبت شود.
+    await state.update_data(
+        guarantor_id=guarantor_id,
+        loan_interest=interest,
+        loan_total_repayment=total_repayment,
+        borrower_collateral_amount=borrower_collateral,
+        guarantor_collateral_amount=guarantor_collateral,
+    )
+
+    guarantor_name = html.escape(guarantor_data["full_name"] or str(guarantor_id))
+    preview_text = (
+        "🔍 <b>پیش‌نمایش درخواست وام ضامنی</b>\n\n"
+        f"💳 مبلغ وام: <code>₳ {amount}</code>\n"
+        f"📈 نرخ سود: <b>{interest}٪</b>\n"
+        f"🔢 تعداد اقساط: <b>{installments}</b>\n"
+        f"🧮 مجموع بازپرداخت: <code>₳ {total_repayment}</code>\n"
+        f"🤝 ضامن: <b>{guarantor_name}</b> (<code>{guarantor_id}</code>)\n\n"
+        f"🔒 وثیقه گیرنده (فقط با تأیید نهایی سوپرادمین قفل می‌شود): <code>₳ {borrower_collateral}</code>\n"
+        f"🔒 وثیقه ضامن (فقط با تأیید نهایی سوپرادمین قفل می‌شود): <code>₳ {guarantor_collateral}</code>\n\n"
+        f"💰 موجودی آزاد لازم شما: <code>₳ {required_balance_borrower}</code>\n"
+        f"💰 موجودی آزاد لازم ضامن: <code>₳ {required_balance_guarantor}</code>\n\n"
+        "⚠️ با تأیید، درخواست ضمانت برای ضامن انتخابی ارسال خواهد شد."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید و ارسال به ضامن", callback_data="loan_guarantor_preview_confirm"),
+        InlineKeyboardButton(text="❌ انصراف", callback_data="loan_guarantor_preview_cancel"),
+    ]])
+    prompt = await message.reply(preview_text, reply_markup=kb, parse_mode="HTML")
+    await state.set_state(LoanForm.waiting_for_guarantor_confirm)
+    current_state = await state.get_state()
+    schedule_input_timeout(
+        state, message.chat.id, user_id, current_state,
+        lambda: _default_timeout_notice(message.bot, message.chat.id, prompt.message_id),
+    )
+
+
+@user_router.callback_query(LoanForm.waiting_for_guarantor_confirm, F.data == "loan_guarantor_preview_cancel")
+async def cb_loan_guarantor_preview_cancel(callback: CallbackQuery, state: FSMContext):
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    # ❌ انصراف: هیچ ثبت وام و هیچ تغییر مالی‌ای تا این مرحله انجام نشده، فقط State پاک می‌شود.
+    await state.clear()
+    try:
+        await callback.message.edit_text("❌ درخواست وام لغو شد. هیچ ثبت یا تغییر مالی‌ای انجام نشد.")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@user_router.callback_query(LoanForm.waiting_for_guarantor_confirm, F.data == "loan_guarantor_preview_confirm")
+async def cb_loan_guarantor_preview_confirm(callback: CallbackQuery, state: FSMContext):
+    cancel_input_timeout(callback.message.chat.id, callback.from_user.id)
+    data = await state.get_data()
+    user_id = callback.from_user.id
+    guarantor_id = data.get("guarantor_id")
+    amount = data.get("loan_amount")
+    installments = data.get("loan_installments")
+    interest = data.get("loan_interest")
+    total_repayment = data.get("loan_total_repayment")
+    borrower_collateral = data.get("borrower_collateral_amount", 0)
+    guarantor_collateral = data.get("guarantor_collateral_amount", 0)
+
+    if not guarantor_id or amount is None or installments is None or interest is None:
+        await state.clear()
+        return await callback.answer("❌ اطلاعات درخواست نامعتبر شده است. لطفاً دوباره تلاش کنید.", show_alert=True)
+
+    # 🚫 بررسی مجدد Pending بلافاصله پیش از ثبت، برای جلوگیری از ثبت همزمان دو درخواست
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM loans WHERE user_id = ? AND status IN ('PENDING_ADMIN', 'PENDING_GUARANTOR', 'PENDING_GUARANTOR_FINAL') LIMIT 1",
+            (user_id,),
+        ) as cur:
+            has_pending = await cur.fetchone()
+    if has_pending:
+        await state.clear()
+        try:
+            await callback.message.edit_text(
+                "❌ شما در حال حاضر یک درخواست وام در حال بررسی دارید. این درخواست ثبت نشد."
+            )
+        except Exception:
+            pass
+        return await callback.answer()
+
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 """
                 INSERT INTO loans
                 (user_id, guarantor_id, total_amount, interest_rate, total_repayment,
-                 installments_count, status, loan_type, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'PENDING_GUARANTOR', 'GUARANTOR', ?)
+                 installments_count, status, loan_type, created_at,
+                 borrower_collateral_amount, guarantor_collateral_amount)
+                VALUES (?, ?, ?, ?, ?, ?, 'PENDING_GUARANTOR', 'GUARANTOR', ?, ?, ?)
                 """,
-                (user_id, guarantor_id, amount, interest, total_repayment, installments, datetime.now(timezone.utc).isoformat()),
+                (
+                    user_id, guarantor_id, amount, interest, total_repayment, installments,
+                    datetime.now(timezone.utc).isoformat(), borrower_collateral, guarantor_collateral,
+                ),
             )
             loan_id = cur.lastrowid
             await db.commit()
@@ -3774,40 +7205,98 @@ async def loan_process_guarantor(message: Message, state: FSMContext):
         InlineKeyboardButton(text="❌ قبول نمی‌کنم", callback_data=f"guarantor_reject_{loan_id}"),
     ]])
     try:
-        await message.bot.send_message(
+        await callback.bot.send_message(
             guarantor_id,
             f"🤝 کاربر <b>{requester_name}</b> درخواست وام <code>₳ {amount}</code> آتر با سود "
             f"<b>{interest}٪</b> در <b>{installments}</b> قسط کرده است.\n"
+            f"🔒 در صورت تأیید نهایی سوپرادمین، مبلغ <code>₳ {guarantor_collateral}</code> از موجودی آزاد شما "
+            "به‌عنوان وثیقه قفل خواهد شد.\n\n"
             "آیا حاضر می‌شوید ضامن این شخص شوید؟\n\n"
             "⚠️ نکته: در صورت عدم پرداخت اقساط توسط متقاضی، مبالغ اقساط از موجودی شما کسر خواهد شد.",
             reply_markup=kb,
             parse_mode="HTML",
         )
-        await message.reply("✅ درخواست تایید ضمانت برای ضامن انتخابی ارسال شد. پس از تایید ایشان، درخواست شما برای سوپرادمین ارسال خواهد شد.")
+        try:
+            await callback.message.edit_text(
+                "✅ درخواست تایید ضمانت برای ضامن انتخابی ارسال شد. پس از تایید ایشان، درخواست شما برای سوپرادمین ارسال خواهد شد."
+            )
+        except Exception:
+            pass
     except Exception:
-        await message.reply("❌ امکان ارسال پیام به ضامن انتخابی وجود ندارد (احتمالاً ربات را استارت نکرده است).")
+        try:
+            await callback.message.edit_text("❌ امکان ارسال پیام به ضامن انتخابی وجود ندارد (احتمالاً ربات را استارت نکرده است).")
+        except Exception:
+            pass
+    await callback.answer()
 
 
 @user_router.callback_query(F.data.startswith("guarantor_accept_"))
 async def cb_guarantor_accept(callback: CallbackQuery):
+    """مرحله ۱ (تأیید اولیه ضامن): وضعیت را به PENDING_GUARANTOR_FINAL می‌برد و هشدار نهایی را نمایش می‌دهد."""
     loan_id = int(callback.data.split("_")[2])
     guarantor_id = callback.from_user.id
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)) as cur:
-            loan = await cur.fetchone()
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            # 🔒 آپدیت شرطی اتمیک: تنها زمانی اعمال می‌شود که هنوز PENDING_GUARANTOR و متعلق به
+            # همین ضامن باشد؛ این کار تضمین می‌کند دو کلیک هم‌زمان (یا کلیک تکراری) فقط یک‌بار اثر کند.
+            cur = await db.execute(
+                "UPDATE loans SET status = 'PENDING_GUARANTOR_FINAL' "
+                "WHERE id = ? AND guarantor_id = ? AND status = 'PENDING_GUARANTOR'",
+                (loan_id, guarantor_id),
+            )
+            updated = cur.rowcount > 0
+            await db.commit()
+            if not updated:
+                return await callback.answer("❌ این درخواست دیگر معتبر نیست یا قبلاً پردازش شده است.", show_alert=True)
 
-    if not loan or loan["guarantor_id"] != guarantor_id or loan["status"] != "PENDING_GUARANTOR":
-        return await callback.answer("❌ این درخواست دیگر معتبر نیست.", show_alert=True)
+            async with db.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)) as cur2:
+                loan = await cur2.fetchone()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ تأیید نهایی ضمانت", callback_data=f"guarantor_final_accept_{loan_id}"),
+        InlineKeyboardButton(text="❌ انصراف", callback_data=f"guarantor_reject_{loan_id}"),
+    ]])
+    try:
+        await callback.message.edit_text(
+            "⚠️ <b>هشدار نهایی</b>\n\n"
+            f"با تأیید نهایی، مبلغ <code>₳ {loan['guarantor_collateral_amount'] or 0}</code> از موجودی آزاد شما "
+            "به‌عنوان وثیقه ضمانت این وام قفل خواهد شد (فقط در لحظه تأیید نهایی سوپرادمین).\n"
+            "همچنین در صورت عدم پرداخت اقساط توسط متقاضی، مبالغ اقساط از موجودی شما کسر خواهد شد.\n\n"
+            "برای ادامه، تأیید نهایی خود را اعلام کنید.",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@user_router.callback_query(F.data.startswith("guarantor_final_accept_"))
+async def cb_guarantor_final_accept(callback: CallbackQuery):
+    """مرحله ۲ (تأیید نهایی ضامن): وضعیت را به PENDING_ADMIN می‌برد و برای سوپرادمین ارسال می‌کند."""
+    loan_id = int(callback.data.split("_")[3])
+    guarantor_id = callback.from_user.id
 
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE loans SET status = 'PENDING_ADMIN' WHERE id = ?", (loan_id,))
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "UPDATE loans SET status = 'PENDING_ADMIN' "
+                "WHERE id = ? AND guarantor_id = ? AND status = 'PENDING_GUARANTOR_FINAL'",
+                (loan_id, guarantor_id),
+            )
+            updated = cur.rowcount > 0
             await db.commit()
+            if not updated:
+                return await callback.answer("❌ این درخواست دیگر معتبر نیست یا قبلاً پردازش شده است.", show_alert=True)
+
+            async with db.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)) as cur2:
+                loan = await cur2.fetchone()
 
     try:
-        await callback.message.edit_text("✅ شما به‌عنوان ضامن این وام ثبت شدید. درخواست برای بررسی نهایی به سوپرادمین ارسال شد.")
+        await callback.message.edit_text("✅ ضمانت شما نهایی شد. درخواست برای بررسی نهایی به سوپرادمین ارسال شد.")
     except Exception:
         pass
     await callback.answer()
@@ -3817,7 +7306,7 @@ async def cb_guarantor_accept(callback: CallbackQuery):
     try:
         await callback.bot.send_message(
             loan["user_id"],
-            "🤝 ضامن شما درخواست ضمانت را پذیرفت. درخواست وام شما برای بررسی نهایی به سوپرادمین ارسال شد.",
+            "🤝 ضامن شما تأیید نهایی ضمانت را انجام داد. درخواست وام شما برای بررسی نهایی به سوپرادمین ارسال شد.",
         )
     except Exception:
         pass
@@ -3825,21 +7314,25 @@ async def cb_guarantor_accept(callback: CallbackQuery):
 
 @user_router.callback_query(F.data.startswith("guarantor_reject_"))
 async def cb_guarantor_reject(callback: CallbackQuery):
+    """رد ضمانت توسط ضامن، در هر یک از دو مرحله (تأیید اولیه یا تأیید نهایی) قابل انجام است."""
     loan_id = int(callback.data.split("_")[2])
     guarantor_id = callback.from_user.id
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)) as cur:
-            loan = await cur.fetchone()
-
-    if not loan or loan["guarantor_id"] != guarantor_id or loan["status"] != "PENDING_GUARANTOR":
-        return await callback.answer("❌ این درخواست دیگر معتبر نیست.", show_alert=True)
-
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE loans SET status = 'REJECTED' WHERE id = ?", (loan_id,))
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "UPDATE loans SET status = 'REJECTED' WHERE id = ? AND guarantor_id = ? "
+                "AND status IN ('PENDING_GUARANTOR', 'PENDING_GUARANTOR_FINAL')",
+                (loan_id, guarantor_id),
+            )
+            updated = cur.rowcount > 0
             await db.commit()
+            if not updated:
+                return await callback.answer("❌ این درخواست دیگر معتبر نیست یا قبلاً پردازش شده است.", show_alert=True)
+
+            async with db.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)) as cur2:
+                loan = await cur2.fetchone()
 
     try:
         await callback.message.edit_text("❌ شما درخواست ضمانت را رد کردید.")
@@ -3884,6 +7377,70 @@ async def cb_loan_admin_approve(callback: CallbackQuery):
                 except Exception:
                     pass
                 return await callback.answer("❌ موجودی خزانه کافی نیست.", show_alert=True)
+
+            # 🔒 طبق سیستم جدید وثیقه، مبلغ وثیقه فقط اکنون (لحظه تأیید نهایی سوپرادمین) از موجودی
+            # قابل‌انتقال کاربر کسر و به frozen_balance منتقل می‌شود. اگر کاربر دیگر موجودی کافی
+            # نداشته باشد یا حسابش فریز باشد، کل عملیات (از جمله برداشت از خزانه بالا) لغو می‌شود
+            # چون تراکنش commit نشده و با بسته‌شدن اتصال به‌طور خودکار rollback خواهد شد.
+            if loan["loan_type"] == "COLLATERAL":
+                collateral_amount = loan["collateral_amount"] or 0
+                async with db.execute(
+                    "SELECT balance, frozen_balance, is_frozen FROM users WHERE user_id = ?", (loan["user_id"],)
+                ) as cur_u:
+                    borrower = await cur_u.fetchone()
+
+                borrower_transferable = max(0, borrower["balance"] - borrower["frozen_balance"]) if borrower else 0
+                if not borrower or borrower["is_frozen"] or borrower_transferable < collateral_amount:
+                    return await callback.answer(
+                        "❌ موجودی قابل‌انتقال متقاضی برای قفل‌کردن وثیقه کافی نیست یا حساب او فریز است. "
+                        "می‌توانید درخواست را رد کنید یا بعداً دوباره تلاش کنید.",
+                        show_alert=True,
+                    )
+
+                await db.execute(
+                    "UPDATE users SET frozen_balance = frozen_balance + ? WHERE user_id = ?",
+                    (collateral_amount, loan["user_id"]),
+                )
+
+            # 🤝 وام ضامنی: طبق همان منطق، وثیقه گیرنده و ضامن فقط اکنون (لحظه تأیید نهایی
+            # سوپرادمین) از موجودی قابل‌انتقال هرکدام کسر و به frozen_balance آن‌ها منتقل
+            # می‌شود. اگر موجودی هرکدام کافی نباشد یا حساب هرکدام فریز باشد، کل عملیات
+            # (از جمله برداشت از خزانه بالا) به‌دلیل عدم commit به‌طور خودکار rollback می‌شود.
+            elif loan["loan_type"] == "GUARANTOR":
+                borrower_collateral = loan["borrower_collateral_amount"] or 0
+                guarantor_collateral = loan["guarantor_collateral_amount"] or 0
+                guarantor_id = loan["guarantor_id"]
+
+                async with db.execute(
+                    "SELECT balance, frozen_balance, is_frozen FROM users WHERE user_id = ?", (loan["user_id"],)
+                ) as cur_u:
+                    borrower = await cur_u.fetchone()
+                async with db.execute(
+                    "SELECT balance, frozen_balance, is_frozen FROM users WHERE user_id = ?", (guarantor_id,)
+                ) as cur_g:
+                    guarantor = await cur_g.fetchone()
+
+                borrower_transferable = max(0, borrower["balance"] - borrower["frozen_balance"]) if borrower else 0
+                guarantor_transferable = max(0, guarantor["balance"] - guarantor["frozen_balance"]) if guarantor else 0
+
+                if (
+                    not borrower or borrower["is_frozen"] or borrower_transferable < borrower_collateral
+                    or not guarantor or guarantor["is_frozen"] or guarantor_transferable < guarantor_collateral
+                ):
+                    return await callback.answer(
+                        "❌ موجودی قابل‌انتقال گیرنده یا ضامن برای قفل‌کردن وثیقه‌ها کافی نیست یا حساب یکی از "
+                        "آن‌ها فریز است. می‌توانید درخواست را رد کنید یا بعداً دوباره تلاش کنید.",
+                        show_alert=True,
+                    )
+
+                await db.execute(
+                    "UPDATE users SET frozen_balance = frozen_balance + ? WHERE user_id = ?",
+                    (borrower_collateral, loan["user_id"]),
+                )
+                await db.execute(
+                    "UPDATE users SET frozen_balance = frozen_balance + ? WHERE user_id = ?",
+                    (guarantor_collateral, guarantor_id),
+                )
 
             await db.execute(
                 "UPDATE users SET balance = balance + ? WHERE user_id = ?",
@@ -3930,14 +7487,8 @@ async def cb_loan_admin_reject(callback: CallbackQuery):
             if not loan or loan["status"] != "PENDING_ADMIN":
                 return await callback.answer("❌ این درخواست دیگر معتبر نیست یا قبلاً پردازش شده است.", show_alert=True)
 
-            if loan["loan_type"] == "COLLATERAL":
-                settings = await _get_loan_settings()
-                collateral_amount = int(loan["total_amount"] * float(settings["collateral_rate"]))
-                await db.execute(
-                    "UPDATE users SET frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
-                    (collateral_amount, loan["user_id"]),
-                )
-
+            # ⚠️ طبق سیستم جدید وثیقه، هیچ مبلغی پیش از تأیید سوپرادمین قفل نمی‌شود؛
+            # بنابراین هنگام رد درخواست هم نیازی به آزادسازی frozen_balance نیست.
             await db.execute("UPDATE loans SET status = 'REJECTED' WHERE id = ?", (loan_id,))
             await db.commit()
 
@@ -3958,7 +7509,7 @@ async def _build_my_loans_view(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM loans WHERE user_id = ? AND status IN ('ACTIVE', 'PENDING_ADMIN', 'PENDING_GUARANTOR') ORDER BY id DESC",
+            "SELECT * FROM loans WHERE user_id = ? AND status IN ('ACTIVE', 'PENDING_ADMIN', 'PENDING_GUARANTOR', 'PENDING_GUARANTOR_FINAL') ORDER BY id DESC",
             (user_id,),
         ) as cur:
             loans = await cur.fetchall()
@@ -3967,7 +7518,9 @@ async def _build_my_loans_view(user_id: int):
         return "📋 شما در حال حاضر هیچ وام فعال یا در حال بررسی‌ای ندارید.", None
 
     status_labels = {
-        "ACTIVE": "🟢 فعال", "PENDING_ADMIN": "⏳ در انتظار تایید سوپرادمین", "PENDING_GUARANTOR": "⏳ در انتظار تایید ضامن",
+        "ACTIVE": "🟢 فعال", "PENDING_ADMIN": "⏳ در انتظار تایید سوپرادمین",
+        "PENDING_GUARANTOR": "⏳ در انتظار تایید اولیه ضامن",
+        "PENDING_GUARANTOR_FINAL": "⏳ در انتظار تایید نهایی ضامن",
     }
     parts = ["📋 <b>وام‌های شما:</b>\n"]
     kb_rows = []
@@ -3991,6 +7544,11 @@ async def _build_my_loans_view(user_id: int):
                     text=f"💳 پرداخت قسط #{next_inst['installment_number']} وام #{loan['id']}",
                     callback_data=f"pay_inst_{next_inst['id']}",
                 )])
+        elif loan["status"] in ("PENDING_ADMIN", "PENDING_GUARANTOR", "PENDING_GUARANTOR_FINAL"):
+            kb_rows.append([InlineKeyboardButton(
+                text=f"❌ لغو درخواست وام #{loan['id']}",
+                callback_data=f"cancel_loan_req_{loan['id']}",
+            )])
 
     text = "".join(parts)
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
@@ -4015,6 +7573,52 @@ async def cb_my_loans_list(callback: CallbackQuery):
     await callback.answer()
 
 
+@user_router.callback_query(F.data.startswith("cancel_loan_req_"))
+async def cb_cancel_loan_request(callback: CallbackQuery):
+    loan_id = int(callback.data[len("cancel_loan_req_"):])
+    user_id = callback.from_user.id
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)) as cur:
+            loan = await cur.fetchone()
+
+    if not loan or loan["user_id"] != user_id or loan["status"] not in ("PENDING_ADMIN", "PENDING_GUARANTOR", "PENDING_GUARANTOR_FINAL"):
+        return await callback.answer("❌ این درخواست دیگر معتبر نیست یا قابل لغو نیست.", show_alert=True)
+
+    prev_status = loan["status"]
+
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            # ⚠️ فقط تغییر وضعیت به CANCELLED؛ رکورد حذف نمی‌شود و چون تا این مرحله هیچ مبلغی
+            # (وثیقه یا غیره) قفل/کسر نشده، هیچ آزادسازی یا برگشت مالی لازم نیست.
+            await db.execute("UPDATE loans SET status = 'CANCELLED' WHERE id = ?", (loan_id,))
+            cancel_tx_id = f"TRZ-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{random.randint(1000, 9999)}"
+            await db.execute(
+                "INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason) VALUES (?, ?, ?, 0, 0, ?)",
+                (
+                    cancel_tx_id, datetime.now(timezone.utc).isoformat(), user_id,
+                    f"[LOAN_CANCELLED] لغو درخواست وام #{loan_id} توسط متقاضی",
+                ),
+            )
+            await db.commit()
+
+    text, kb = await _build_my_loans_view(user_id)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer("✅ درخواست وام لغو شد.", show_alert=True)
+
+    if prev_status in ("PENDING_GUARANTOR", "PENDING_GUARANTOR_FINAL") and loan["guarantor_id"]:
+        try:
+            await callback.bot.send_message(
+                loan["guarantor_id"], f"ℹ️ درخواست وام #{loan_id} که در انتظار تایید شما بود، توسط متقاضی لغو شد."
+            )
+        except Exception:
+            pass
+
+
 @user_router.callback_query(F.data.startswith("pay_inst_"))
 async def cb_pay_installment(callback: CallbackQuery):
     installment_id = int(callback.data.split("_")[2])
@@ -4032,8 +7636,20 @@ async def cb_pay_installment(callback: CallbackQuery):
 
             if not inst or inst["loan_user_id"] != user_id:
                 return await callback.answer("❌ این قسط متعلق به شما نیست یا یافت نشد.", show_alert=True)
+            if inst["status"] == "MERGED":
+                return await callback.answer("این سررسید به قسط جدید منتقل شده است.", show_alert=True)
             if inst["status"] != "PENDING":
-                return await callback.answer("✅ این قسط قبلاً پرداخت شده است.", show_alert=True)
+                return await callback.answer("این قسط پرداخت شده است، لطفاً منتظر سررسید بعدی باشید.", show_alert=True)
+
+            # ⏳ امکان پرداخت زودتر از موعد سررسید وجود ندارد
+            due_date = datetime.fromisoformat(inst["due_date"])
+            if due_date.tzinfo is None:
+                due_date = due_date.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) < due_date:
+                return await callback.answer(
+                    f"⏳ سررسید این قسط هنوز نرسیده است. تاریخ سررسید: {due_date.strftime('%Y-%m-%d')}",
+                    show_alert=True,
+                )
 
             async with db.execute("SELECT balance, is_frozen FROM users WHERE user_id = ?", (user_id,)) as cur_u:
                 u = await cur_u.fetchone()
@@ -4051,9 +7667,10 @@ async def cb_pay_installment(callback: CallbackQuery):
                 (datetime.now(timezone.utc).isoformat(), installment_id),
             )
 
-            # بررسی تسویه کامل وام
+            # بررسی تسویه کامل وام (اقساط ادغام‌شده/MERGED هم به‌عنوان تسویه‌شده در نظر گرفته می‌شوند،
+            # چون مبلغشان قبلاً در قسط جدید‌تر ادغام و همراه آن پرداخت شده است)
             async with db.execute(
-                "SELECT COUNT(*) FROM loan_installments WHERE loan_id = ? AND status != 'PAID'",
+                "SELECT COUNT(*) FROM loan_installments WHERE loan_id = ? AND status NOT IN ('PAID', 'MERGED')",
                 (inst["loan_id"],),
             ) as cur_c:
                 remaining = (await cur_c.fetchone())[0]
@@ -4061,16 +7678,42 @@ async def cb_pay_installment(callback: CallbackQuery):
             fully_paid = remaining == 0
             if fully_paid:
                 if inst["guarantor_id"] == 0:
-                    # آزادسازی کامل وثیقه در پایان وام وثیقه‌ای
-                    async with db.execute("SELECT total_amount FROM loans WHERE id = ?", (inst["loan_id"],)) as cur_l:
+                    # آزادسازی کامل وثیقه در پایان وام وثیقه‌ای (همان مبلغی که در لحظه تأیید سوپرادمین قفل شد)
+                    async with db.execute("SELECT collateral_amount FROM loans WHERE id = ?", (inst["loan_id"],)) as cur_l:
                         loan_row = await cur_l.fetchone()
-                    settings = await _get_loan_settings()
-                    collateral_amount = int(loan_row[0] * float(settings["collateral_rate"]))
+                    collateral_amount = (loan_row[0] or 0) if loan_row else 0
                     await db.execute(
                         "UPDATE users SET frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
                         (collateral_amount, user_id),
                     )
+                else:
+                    # 🤝 آزادسازی کامل وثیقه گیرنده و ضامن در پایان وام ضامنی (همان مبالغی که در
+                    # لحظه تأیید سوپرادمین قفل شدند)
+                    async with db.execute(
+                        "SELECT borrower_collateral_amount, guarantor_collateral_amount FROM loans WHERE id = ?",
+                        (inst["loan_id"],),
+                    ) as cur_l:
+                        loan_row = await cur_l.fetchone()
+                    b_collateral = (loan_row[0] or 0) if loan_row else 0
+                    g_collateral = (loan_row[1] or 0) if loan_row else 0
+                    await db.execute(
+                        "UPDATE users SET frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
+                        (b_collateral, user_id),
+                    )
+                    await db.execute(
+                        "UPDATE users SET frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
+                        (g_collateral, inst["guarantor_id"]),
+                    )
                 await db.execute("UPDATE loans SET status = 'PAID' WHERE id = ?", (inst["loan_id"],))
+                # 📝 ثبت رویداد تسویه کامل وام در سیستم لاگ
+                settle_tx_id = f"TRZ-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{random.randint(1000, 9999)}"
+                await db.execute(
+                    "INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason) VALUES (?, ?, ?, 0, 0, ?)",
+                    (
+                        settle_tx_id, datetime.now(timezone.utc).isoformat(), user_id,
+                        f"[LOAN_SETTLED] تسویه کامل وام #{inst['loan_id']}",
+                    ),
+                )
 
             await db.commit()
 
@@ -4093,7 +7736,8 @@ async def process_due_installments(bot: Bot):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT li.*, l.user_id AS loan_user_id, l.guarantor_id "
+            "SELECT li.*, l.user_id AS loan_user_id, l.guarantor_id, l.total_amount AS loan_total_amount, "
+            "l.installments_count AS loan_installments_count "
             "FROM loan_installments li JOIN loans l ON li.loan_id = l.id "
             "WHERE li.status = 'PENDING' AND l.status = 'ACTIVE'"
         ) as cur:
@@ -4110,24 +7754,111 @@ async def process_due_installments(bot: Bot):
         hours_late = (now - due_date).total_seconds() / 3600.0
         borrower_id = inst["loan_user_id"]
 
-        # یادآوری محرمانه سررسید (صرفاً در پیوی متقاضی)
-        if 0 <= hours_late < 1 and inst["last_reminder_stage"] != "DUE":
+        # 🔔 یادآوری ۲۴ ساعت قبل از سررسید (فقط یک‌بار، صرفاً در پیوی متقاضی)
+        # بازه به‌صورت «حداکثر ۲۴ ساعت مانده» در نظر گرفته شده (نه فقط یک بازه یک‌ساعته دقیق)
+        # تا در صورت خاموش بودن موقت ربات، پیام پس از روشن شدن مجدد از قلم نیفتد.
+        if -24 <= hours_late < 0 and inst["last_reminder_stage"] not in ("REMINDER_24H", "DUE", "GRACE_OVER"):
             try:
                 await bot.send_message(
                     borrower_id,
-                    f"⏰ قسط #{inst['installment_number']} وام #{inst['loan_id']} به مبلغ "
-                    f"<code>₳ {inst['amount']}</code> امروز سررسید شده است.\n"
-                    f"💳 مهلت طلایی ۲۴ ساعته بدون جریمه دارید.",
-                    parse_mode="HTML",
+                    "🔔 یادآوری پرداخت قسط\n"
+                    "کاربر گرامی، تاریخ پرداخت قسط وام شما تا ۲۴ ساعت آینده فرا می‌رسد. "
+                    "لطفاً جهت جلوگیری از اعمال جریمه دیرکرد، نسبت به پرداخت قسط اقدام نمایید.\n"
+                    "بانک مرکزی آترامنتوم",
                 )
             except Exception:
                 pass
             async with db_lock:
                 async with aiosqlite.connect(DB_PATH) as db:
                     await db.execute(
+                        "UPDATE loan_installments SET last_reminder_stage = 'REMINDER_24H' WHERE id = ?", (inst["id"],)
+                    )
+                    await db.commit()
+            continue
+
+        # ⏰ پیام سررسید (از لحظه فرارسیدن سررسید به بعد) + اطلاعات کامل وام + دکمه پرداخت مستقیم
+        # بازه به‌صورت «از سررسید به بعد» در نظر گرفته شده (نه فقط بازه یک‌ساعته دقیق) تا در صورت
+        # خاموش بودن موقت ربات، پیام سررسید پس از روشن شدن مجدد حتماً ارسال شود.
+        if hours_late >= 0 and inst["last_reminder_stage"] not in ("DUE", "GRACE_OVER"):
+            # 🔗 انباشت اقساط عقب‌افتاده: اگر قسط(های) قبلی همین وام هنوز پرداخت نشده باشند
+            # (مثلاً به دلیل ناکافی بودن موجودی/وثیقه/ضامن در کسر خودکار)، مبلغ آن‌ها به این
+            # سررسید جدید اضافه و دیگر به‌صورت مستقل قابل پرداخت نخواهند بود.
+            async with aiosqlite.connect(DB_PATH) as db_m:
+                db_m.row_factory = aiosqlite.Row
+                async with db_m.execute(
+                    "SELECT id, installment_number, amount FROM loan_installments "
+                    "WHERE loan_id = ? AND status = 'PENDING' AND installment_number < ? ORDER BY installment_number",
+                    (inst["loan_id"], inst["installment_number"]),
+                ) as cur_prev:
+                    overdue_prev = await cur_prev.fetchall()
+
+            carried_over = sum(p["amount"] for p in overdue_prev)
+            combined_amount = inst["amount"] + carried_over
+
+            async with db_lock:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    if overdue_prev:
+                        for p in overdue_prev:
+                            await db.execute(
+                                "UPDATE loan_installments SET status = 'MERGED' WHERE id = ?", (p["id"],)
+                            )
+                        # ⚠️ base_amount هم باید به‌روزرسانی شود، وگرنه محاسبه جریمه دیرکرد بعدی این
+                        # قسط (که بر اساس base_amount انجام می‌شود) بدهی ادغام‌شده را نادیده می‌گیرد.
+                        await db.execute(
+                            "UPDATE loan_installments SET amount = ?, base_amount = ? WHERE id = ?",
+                            (combined_amount, combined_amount, inst["id"]),
+                        )
+                    await db.execute(
                         "UPDATE loan_installments SET last_reminder_stage = 'DUE' WHERE id = ?", (inst["id"],)
                     )
                     await db.commit()
+
+            async with aiosqlite.connect(DB_PATH) as db_r:
+                db_r.row_factory = aiosqlite.Row
+                async with db_r.execute(
+                    "SELECT COUNT(*) AS paid_count FROM loan_installments WHERE loan_id = ? AND status = 'PAID'",
+                    (inst["loan_id"],),
+                ) as cur_p:
+                    paid_count = (await cur_p.fetchone())["paid_count"]
+
+            total_installments = inst["loan_installments_count"] or 1
+            # 🧮 تفکیک تناسبی اصل و سود همین قسط (بر اساس مبلغ اصل کل وام تقسیم‌شده به تعداد اقساط)
+            base_principal_each = inst["loan_total_amount"] // total_installments
+            remainder_principal = inst["loan_total_amount"] - (base_principal_each * total_installments)
+            principal_part = base_principal_each + (remainder_principal if inst["installment_number"] == total_installments else 0)
+            interest_part = max(0, inst["base_amount"] - principal_part)
+
+            carried_over_text = ""
+            if overdue_prev:
+                breakdown_lines = "\n".join(
+                    f"   ↳ قسط #{p['installment_number']} (عقب‌افتاده): <code>₳ {p['amount']}</code>"
+                    for p in overdue_prev
+                )
+                carried_over_text = (
+                    f"\n⚠️ <b>اقساط عقب‌افتاده به این سررسید اضافه شد:</b>\n{breakdown_lines}\n"
+                    f"💳 مبلغ قسط جدید: <code>₳ {inst['amount']}</code>\n"
+                )
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="💳 پرداخت قسط", callback_data=f"pay_inst_{inst['id']}")
+            ]])
+            try:
+                await bot.send_message(
+                    borrower_id,
+                    f"⏰ <b>سررسید قسط وام</b>\n\n"
+                    f"🔢 شماره قسط: <code>{inst['installment_number']}</code>\n"
+                    f"💰 مبلغ اصل قسط: <code>₳ {principal_part}</code>\n"
+                    f"📈 سود این قسط: <code>₳ {interest_part}</code>\n"
+                    f"✅ اقساط پرداخت‌شده: <code>{paid_count}/{total_installments}</code>\n"
+                    f"⏳ اقساط باقی‌مانده: <code>{total_installments - paid_count}</code>\n"
+                    f"{carried_over_text}"
+                    f"🧮 مبلغ کل قابل پرداخت (شامل جریمه در صورت وجود): <code>₳ {combined_amount}</code>\n\n"
+                    f"بانک مرکزی آترامنتوم",
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
             continue
 
         if hours_late < BANK_GRACE_PERIOD_HOURS:
@@ -4259,13 +7990,29 @@ async def _auto_collect_overdue_installment(bot: Bot, installment_id: int):
                     remaining_count = (await cur_c.fetchone())[0]
                 if remaining_count == 0:
                     if not guarantor_id:
-                        async with db.execute("SELECT total_amount FROM loans WHERE id = ?", (inst["loan_id"],)) as cur_l:
+                        async with db.execute("SELECT collateral_amount FROM loans WHERE id = ?", (inst["loan_id"],)) as cur_l:
                             loan_row = await cur_l.fetchone()
-                        settings = await _get_loan_settings()
-                        collateral_amount = int(loan_row[0] * float(settings["collateral_rate"]))
+                        collateral_amount = (loan_row[0] or 0) if loan_row else 0
                         await db.execute(
                             "UPDATE users SET frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
                             (collateral_amount, borrower_id),
+                        )
+                    else:
+                        # 🤝 آزادسازی کامل وثیقه گیرنده و ضامن در پایان وام ضامنی (پس از کسر خودکار آخرین قسط)
+                        async with db.execute(
+                            "SELECT borrower_collateral_amount, guarantor_collateral_amount FROM loans WHERE id = ?",
+                            (inst["loan_id"],),
+                        ) as cur_l:
+                            loan_row = await cur_l.fetchone()
+                        b_collateral = (loan_row[0] or 0) if loan_row else 0
+                        g_collateral = (loan_row[1] or 0) if loan_row else 0
+                        await db.execute(
+                            "UPDATE users SET frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
+                            (b_collateral, borrower_id),
+                        )
+                        await db.execute(
+                            "UPDATE users SET frozen_balance = MAX(0, frozen_balance - ?) WHERE user_id = ?",
+                            (g_collateral, guarantor_id),
                         )
                     await db.execute("UPDATE loans SET status = 'PAID' WHERE id = ?", (inst["loan_id"],))
             else:
@@ -4321,6 +8068,16 @@ async def cmd_help(message: Message):
     u = await get_user_data(user_id)
     is_adm = u and u["is_admin"]
 
+    has_approved_shop = False
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT 1 FROM shops WHERE owner_id = ? AND status = 'APPROVED' LIMIT 1", (user_id,)
+        ) as cur:
+            has_approved_shop = (await cur.fetchone()) is not None
+        async with db.execute("SELECT 1 FROM couriers WHERE user_id = ?", (user_id,)) as cur_c:
+            is_courier = (await cur_c.fetchone()) is not None or is_super_admin(user_id)
+
     txt = (
         "📱 <b>راهنمای دستورات کاربران:</b>\n"
         "🔹 <code>/start</code> - شروع و دریافت شماره حساب\n"
@@ -4336,20 +8093,37 @@ async def cmd_help(message: Message):
         "💳 <b>وام آترامنتوم:</b>\n"
         "🔹 <code>/loan</code> یا «درخواست وام» - ثبت درخواست وام جدید (فقط پیوی)\n"
         "🔹 <code>/my_loans</code> - مشاهده وام‌های فعال و پرداخت اقساط\n\n"
+    )
+
+    # 🏪 دستورات فروشندگان: /add_product همیشه برای همه کاربران نمایش داده می‌شود
+    # (حتی قبل از تأیید فروشگاه)، اما /inventory، /my_shop و /delete فقط پس از تأیید فروشگاه
+    # توسط مدیریت و فعال شدن دسترسی فروشگاهی نمایش داده می‌شوند.
+    txt += (
         "🏪 <b>دستورات فروشندگان:</b>\n"
         "🔹 <code>/request_shop</code> - ارسال درخواست ثبت فروشگاه\n"
         "🔹 <code>/add_product</code> - ثبت محصول جديد با عکس و مشخصات\n"
-        "🔹 <code>/inventory</code> - مدیریت موجودی انبار\n"
-        "🔹 <code>/my_shop</code> - آمار کل و میزان درآمد فروشگاه\n\n"
-        "🚚 <b>دستورات پستچی‌ها:</b>\n"
-        "🔹 <code>/courier_orders</code> - مشاهده سفارش‌های آماده ارسال\n"
-        "🔹 <code>/confirm_dispatch [کد]</code> - ثبت تحویل نهایی سفارش با کد ۱۰ رقمی\n\n"
     )
+    if has_approved_shop:
+        txt += (
+            "🔹 <code>/inventory</code> - مدیریت موجودی انبار\n"
+            "🔹 <code>/my_shop</code> - آمار کل و میزان درآمد فروشگاه\n"
+            "🔹 <code>/delete [کد_محصول]</code> - حذف محصول از فروشگاه\n"
+        )
+    txt += "\n"
+
+    # 🚚 دستورات پستچی‌ها: فقط برای کاربرانی که در جدول couriers هستند (یا سوپرادمین) نمایش داده می‌شود
+    if is_courier:
+        txt += (
+            "🚚 <b>دستورات پستچی‌ها:</b>\n"
+            "🔹 <code>/courier_orders</code> - مشاهده سفارش‌های آماده ارسال\n"
+            "🔹 <code>/confirm_dispatch [کد]</code> - ثبت تحویل نهایی سفارش با کد ۱۰ رقمی\n\n"
+        )
 
     if is_adm or is_sa:
         txt += (
             "👥 <b>دستورات ادمین (فقط پیوی):</b>\n"
             "🔹 <code>/users</code> - لیست کاربران\n"
+            "🔹 <code>/frozen_users</code> - لیست کاربران فریز‌شده (صفحه‌بندی ۱۰ نفر)\n"
             "🔹 <code>/groups</code> - لیست گروه‌ها\n"
             "🔹 <code>/group_users [نام]</code> - اعضای یک گروه\n"
             "🔹 <code>/create_group [نام]</code> - فقط اضافه کردن گروه (بدون لینک)\n"
@@ -4366,8 +8140,6 @@ async def cmd_help(message: Message):
     if is_sa:
         txt += (
             "👑 <b>دستورات سوپرادمین (فقط پیوی):</b>\n"
-            "🔸 <code>/set_shop_rates</code> - تنظیم درصدهای مالیات، بانک و سوخت فروشگاه\n"
-            "🔸 <code>/set_courier_rates</code> - تنظیم درصدهای پستی و بازه‌ها\n"
             "🔸 <code>/shop_requests</code> - بررسی درخواست‌های فروشگاه جدید\n"
             "🔸 <code>/remove_shop [آیدی]</code> - حذف یا لغو مجوز فروشگاه\n"
             "🔸 <code>/add_courier [آیدی]</code> - افزودن پستچی جدید\n"
@@ -4381,18 +8153,19 @@ async def cmd_help(message: Message):
             "🔸 <code>/add_super [آیدی]</code> / <code>/remove_super [آیدی]</code> - مدیریت سوپرادمین‌ها\n"
             "🔸 <code>/list_admins</code> - لیست ادمین‌ها و سوپرادمین‌ها\n"
             "🔸 <code>/check [آیدی]</code> - مشاهده اطلاعات کامل حساب\n"
-            "🔸 <code>/economy</code> - آمار کل نقدینگی و وضعیت خزانه مرکزی\n"
-            "🔸 <code>/set_bank_rate [درصد]</code> - تنظیم نرخ سود روزانه بانک\n"
-            "🔸 <code>/set_min_loan [مبلغ]</code> / <code>/set_max_loan [مبلغ]</code> - بازه مبلغ وام\n"
-            "🔸 <code>/set_loan_interest [حداقل] [حداکثر]</code> - بازه سود وام\n"
-            "🔸 <code>/set_loan_installments [لیست با کاما]</code> - تعداد اقساط مجاز\n"
-            "🔸 <code>/set_collateral_rate [نسبت]</code> - نرخ وثیقه وام (مثال: 0.17)\n"
-            "🔸 <code>/set_req_balance_rate [نسبت]</code> - نرخ موجودی اولیه لازم\n"
-            "🔸 <code>/set_late_penalty_rate [نسبت]</code> - نرخ جریمه دیرکرد روزانه\n"
+            "🔸 <code>/economy</code> - آمار کل نقدینگی و وضعیت خزانه مرکزی\n\n"
+            "🏛 <b>دستورات خزانه:</b>\n"
+            "🔸 <code>/treasury</code> - نمایش موجودی و اطلاعات خزانه\n"
+            "🔸 <code>/treasury_add [مقدار] [دلیل]</code> - افزایش دستی موجودی خزانه\n"
+            "🔸 <code>/treasury_sub [مقدار] [دلیل]</code> - کاهش دستی موجودی خزانه\n"
+            "🔸 <code>/treasury_give [آیدی] [مبلغ]</code> - فقط حساب خزانه؛ به کاربر از خزانه پول می‌دهد\n"
+            "🔸 <code>/treasury_take [آیدی] [مبلغ]</code> - فقط حساب خزانه؛ از کاربر می‌گیرد و به خزانه اضافه می‌کند\n"
+            "🔸 <code>/group_salary [گروه] [مبلغ]</code> - فقط حساب خزانه؛ پرداخت پول گروهی از خزانه\n\n"
+            "🔸 <code>/view_set_all</code> - مشاهده تمام تنظیمات و درصدهای سیستم (و دستورهای تغییر هرکدام)\n"
             "🔸 <code>/backup_now</code> - دانلود بکاپ Zip دیتابیس\n"
             "🔸 <code>/force_backup</code> - ارسال فایل دیتابیس به کانال تلگرام\n"
             "🔸 <code>/restore</code> - بازیابی دیتابیس (با ریپلای روی فایل)\n"
-            "🔸 <code>/reset_all</code> - صفر کردن کاملاً دائم دیتابیس\n"
+            "🔸 <code>/reset_all</code> - ریست کامل سیستم (پاک‌سازی تمام داده‌ها به‌جز تنظیمات مدیریتی)\n"
         )
 
     await message.reply(txt, parse_mode="HTML")
