@@ -22,6 +22,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 import aiosqlite
@@ -515,6 +516,8 @@ async def init_db():
 
             # --- 🏦 تنظیمات پیش‌فرض بانک آترامنتوم ---
             ("bank_daily_rate", 1.23),   # درصد سود روزانه پیش‌فرض
+            # سهم سود روزانه بانک که از خزانه مرکزی کسر می‌شود (باقی‌مانده به‌صورت خلق پول تأمین می‌گردد)
+            ("bank_treasury_profit_pct", 45.0),
 
             # --- 💳 تنظیمات پیش‌فرض وام پویا ---
             ("min_loan_amount", 2000),
@@ -735,7 +738,7 @@ os.makedirs(BACKUP_DIR, exist_ok=True)
 def create_zip_backup(prefix="manual"):
     if not os.path.exists(DB_PATH):
         return None
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(IRAN_TZ).strftime("%Y%m%d_%H%M%S")
     zip_name = f"{prefix}_backup_{timestamp}.zip"
     zip_path = os.path.join(BACKUP_DIR, zip_name)
 
@@ -765,13 +768,13 @@ async def restore_db_from_telegram(bot: Bot):
 
 async def auto_backup_loop(bot: Bot):
     while True:
-        await asyncio.sleep(3600)  # ارسال بکاپ خودکار هر ۱ ساعت
+        await asyncio.sleep(900)  # ارسال بکاپ خودکار هر ۱۵ دقیقه
         if os.path.exists(DB_PATH):
             try:
                 await bot.send_document(
                     chat_id=BACKUP_CHANNEL_ID,
                     document=FSInputFile(DB_PATH),
-                    caption=f"<b>📦 بکاپ خودکار دیتابیس</b>\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    caption=f"<b>📦 بکاپ خودکار دیتابیس</b>\n⏰ {datetime.now(IRAN_TZ).strftime('%Y-%m-%d %H:%M:%S')} (به وقت ایران)",
                     parse_mode="HTML"
                 )
                 logging.info("✅ بکاپ خودکار به کانال تلگرام ارسال شد.")
@@ -997,6 +1000,31 @@ async def cmd_start(message: Message):
         )
 
 
+def _profile_text(u, user_id: int) -> str:
+    status_text = "❄️ فریز شده" if u["is_frozen"] else "🟢 فعال"
+    safe_name = html.escape(u['full_name'] or "ناشناس")
+    return (
+        f"👤 نام: {safe_name}\n"
+        f"🆔 شماره حساب: <code>{user_id}</code>\n"
+        f"💰 موجودی: <code>₳ {u['balance']}</code>\n"
+        f"⚡ وضعیت حساب: {status_text}"
+    )
+
+
+def _profile_main_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏦 بانک آترامنتوم", callback_data="prof_bank")],
+        [InlineKeyboardButton(text="📦 لیست دارایی‌ها", callback_data="prof_assets")],
+        [InlineKeyboardButton(text="❓ راهنمایی", callback_data="prof_help")],
+    ])
+
+
+def _profile_help_back_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔙 برگشت به پروفایل", callback_data="prof_home"),
+    ]])
+
+
 @user_router.message(Command("profile"))
 @user_router.message(Command("balance"))
 @user_router.message(F.text == "پروفایل")
@@ -1008,16 +1036,260 @@ async def cmd_profile(message: Message):
     if not u:
         return await message.reply("❌ حساب شما یافت نشد.")
 
-    status_text = "❄️ فریز شده" if u["is_frozen"] else "🟢 فعال"
-    safe_name = html.escape(u['full_name'] or "ناشناس")
-
     await message.reply(
-        f"👤 نام: {safe_name}\n"
-        f"🆔 شماره حساب: <code>{user_id}</code>\n"
-        f"💰 موجودی: <code>₳ {u['balance']}</code>\n"
-        f"⚡ وضعیت حساب: {status_text}",
+        _profile_text(u, user_id),
+        reply_markup=_profile_main_buttons(),
         parse_mode="HTML",
     )
+
+
+@user_router.callback_query(F.data == "prof_home")
+async def cb_prof_home(callback: CallbackQuery):
+    """کلید «🔙 برگشت به پروفایل»: پیام را ویرایش کرده و به حالت اول صفحه /profile بازمی‌گرداند."""
+    user_id = callback.from_user.id
+    u = await get_user_data(user_id)
+    if not u:
+        await callback.answer("❌ حساب شما یافت نشد.", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text(
+            _profile_text(u, user_id),
+            reply_markup=_profile_main_buttons(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@user_router.callback_query(F.data == "prof_help")
+async def cb_prof_help(callback: CallbackQuery):
+    """کلید «❓ راهنمایی»: در گروه فقط لیست دستورات عمومی (بدون درنظرگرفتن سطح دسترسی یا ادمین
+    بودن کاربر) و در پیوی راهنمای کامل و شخصی‌سازی‌شده نمایش داده می‌شود."""
+    group_only = not is_private(callback.message)
+    txt = await _build_help_text(callback.from_user.id, group_only=group_only)
+    try:
+        await callback.message.edit_text(
+            txt,
+            reply_markup=_profile_help_back_buttons(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@user_router.callback_query(F.data == "prof_bank")
+async def cb_prof_bank(callback: CallbackQuery):
+    """کلید «🏦 بانک آترامنتوم»: پیام پروفایل را به ساختار بانک تبدیل می‌کند — در پیوی نمای کامل
+    حساب بانکی (موجودی، سپرده، سود، وام) و در گروه/سوپرگروه نمای خلاصه؛ در هر دو حالت دکمه‌های
+    عملیاتی اصلی بانک (واریز/برداشت/وام/مدیریت) کاملاً فعال هستند و دکمه «🔙 برگشت به پروفایل»
+    در انتهای کیبورد قرار می‌گیرد."""
+    user_id = callback.from_user.id
+    panel_type = "full" if is_private(callback.message) else "panel"
+    rendered = await _bank_render(user_id, panel_type, with_back=True)
+    if not rendered:
+        await callback.answer("❌ حساب شما یافت نشد.", show_alert=True)
+        return
+    text, kb = rendered
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+    await callback.answer()
+
+
+PROF_ASSETS_PAGE_SIZE = 10
+
+
+async def _fetch_profile_assets(user_id: int):
+    """دارایی‌های قطعی (سفارش‌های تحویل‌شده) و سفارش‌های در حال جریان (در انتظار ارسال یا در حال
+    ارسال) کاربر را واکشی می‌کند. طبق اولویت‌بندی درخواستی، دارایی‌های قطعی همیشه در صدر لیست
+    قرار می‌گیرند و پس از آن‌ها سفارش‌های در حال جریان می‌آیند."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM orders WHERE buyer_id = ? AND status = 'DELIVERED' ORDER BY order_id DESC",
+            (user_id,),
+        ) as cur:
+            delivered = await cur.fetchall()
+        async with db.execute(
+            "SELECT * FROM orders WHERE buyer_id = ? AND status IN ('PENDING', 'DISPATCHED') ORDER BY order_id DESC",
+            (user_id,),
+        ) as cur2:
+            in_progress = await cur2.fetchall()
+    return list(delivered) + list(in_progress), len(delivered)
+
+
+def _render_profile_assets_page(items, delivered_count: int, page: int):
+    """متن شماره‌گذاری‌شده (۱۰تایی) و کیبورد دکمه‌های شماره‌ای ۲ستونه + ناوبری صفحه را می‌سازد."""
+    total = len(items)
+    total_pages = max(1, math.ceil(total / PROF_ASSETS_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * PROF_ASSETS_PAGE_SIZE
+    page_items = items[start:start + PROF_ASSETS_PAGE_SIZE]
+
+    txt = f"📦 <b>لیست دارایی‌ها و سفارش‌ها (صفحه {page + 1} از {total_pages})</b>\n"
+    txt += f"مجموع موارد: <code>{total}</code>\n\n"
+
+    if not page_items:
+        txt += "ℹ️ هیچ دارایی یا سفارشی یافت نشد."
+
+    item_buttons = []
+    for offset, o in enumerate(page_items):
+        idx = offset + 1
+        is_asset = (start + offset) < delivered_count
+        emoji = "🟢" if is_asset else "🟡"
+        safe_title = html.escape(o["product_title"] or "محصول حذف‌شده")
+        txt += f"{idx}. {emoji} {safe_title}\n"
+        item_buttons.append(
+            InlineKeyboardButton(text=f"محصول {idx}", callback_data=f"av_{o['order_id']}")
+        )
+
+    # چیدمان منظم ۲ ستونه برای دکمه‌های شماره‌ای
+    kb_rows = [item_buttons[i:i + 2] for i in range(0, len(item_buttons), 2)]
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ صفحه قبل", callback_data=f"ap_{page - 1}"))
+    nav_row.append(InlineKeyboardButton(text=f"📄 صفحه {page + 1} از {total_pages}", callback_data="ignore"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="صفحه بعد ▶️", callback_data=f"ap_{page + 1}"))
+    kb_rows.append(nav_row)
+
+    kb_rows.append([InlineKeyboardButton(text="🔙 برگشت به پروفایل", callback_data="prof_home")])
+    return txt, InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+
+async def _safe_show_text(callback: CallbackQuery, text: str, kb) -> None:
+    """پیام فعلی را با متن/کیبورد داده‌شده به‌روزرسانی می‌کند؛ اگر پیام فعلی رسانه‌ای (مثلاً صفحه
+    جزئیات محصول با عکس) باشد و edit_text ممکن نباشد، پیام قبلی حذف و پیام متنی جدید ارسال
+    می‌شود تا ناوبری بین لیست دارایی‌ها و جزئیات محصول بدون باگ کار کند."""
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        return
+    except Exception:
+        pass
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    try:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+@user_router.callback_query(F.data == "prof_assets")
+async def cb_prof_assets(callback: CallbackQuery):
+    """کلید «📦 لیست دارایی‌ها»: پیام پروفایل را به لیست صفحه‌بندی‌شدهٔ دارایی‌های قطعی و
+    سفارش‌های در حال جریان کاربر تبدیل می‌کند."""
+    items, delivered_count = await _fetch_profile_assets(callback.from_user.id)
+    if not items:
+        await callback.answer("ℹ️ هیچ دارایی یا سفارشی یافت نشد.", show_alert=True)
+        return
+    txt, kb = _render_profile_assets_page(items, delivered_count, 0)
+    await _safe_show_text(callback, txt, kb)
+    await callback.answer()
+
+
+@user_router.callback_query(F.data.startswith("ap_"))
+async def cb_profile_assets_page(callback: CallbackQuery):
+    """ناوبری صفحه‌بندی لیست دارایی‌ها (📄 صفحه قبل/بعد)."""
+    try:
+        page = int(callback.data[len("ap_"):])
+    except ValueError:
+        await callback.answer()
+        return
+    items, delivered_count = await _fetch_profile_assets(callback.from_user.id)
+    if not items:
+        await callback.answer("ℹ️ هیچ دارایی یا سفارشی یافت نشد.", show_alert=True)
+        return
+    txt, kb = _render_profile_assets_page(items, delivered_count, page)
+    await _safe_show_text(callback, txt, kb)
+    await callback.answer()
+
+
+@user_router.callback_query(F.data.startswith("av_"))
+async def cb_profile_asset_detail(callback: CallbackQuery):
+    """دکمه شماره‌ای هر آیتم: جزئیات کامل همان دارایی/سفارش (عکس، عنوان، توضیحات، قیمت، نام
+    فروشگاه و وضعیت ارسال) را نمایش می‌دهد. ابتدا سعی می‌شود پیام فعلی (متن یا عکس) با
+    editMessageMedia/editMessageText به‌روزرسانی شود؛ در صورت بروز خطا یا عدم پشتیبانی، پیام
+    قبلی حذف و پیام جدید ارسال می‌شود."""
+    try:
+        order_id = int(callback.data[len("av_"):])
+    except ValueError:
+        await callback.answer()
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM orders WHERE order_id = ? AND buyer_id = ?", (order_id, callback.from_user.id)
+        ) as cur:
+            order = await cur.fetchone()
+        if not order:
+            await callback.answer("❌ این آیتم یافت نشد.", show_alert=True)
+            return
+
+        shop_name = "نامشخص"
+        async with db.execute("SELECT channel_title FROM shops WHERE shop_id = ?", (order["shop_id"],)) as cur_s:
+            shop_row = await cur_s.fetchone()
+            if shop_row and shop_row["channel_title"]:
+                shop_name = shop_row["channel_title"]
+
+    safe_title = html.escape(order["product_title"] or "محصول حذف‌شده")
+    safe_desc = html.escape(order["product_desc"] or "-")
+    safe_shop = html.escape(shop_name)
+    status_txt = _order_status_label(order["status"])
+
+    caption = (
+        f"🛍 <b>{safe_title}</b>\n\n"
+        f"📝 توضیحات: {safe_desc}\n"
+        f"💰 قیمت: <code>₳ {order['price']}</code>\n"
+        f"🏪 فروشگاه: {safe_shop}\n"
+        f"🔐 کد پیگیری: <code>{order['code_10']}</code>\n"
+        f"⚡ وضعیت: {status_txt}"
+    )
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔙 برگشت به لیست دارایی‌ها", callback_data="prof_assets"),
+    ]])
+    photo_id = order["product_photo_id"]
+
+    edited = False
+    try:
+        if photo_id:
+            # تبدیل پیام (متن یا عکس فعلی) به عکس+کپشن جدید
+            await callback.message.edit_media(
+                media=InputMediaPhoto(media=photo_id, caption=caption, parse_mode="HTML"),
+                reply_markup=back_kb,
+            )
+        else:
+            # محصول عکس ندارد؛ صرفاً در صورتی که پیام فعلی هم متنی باشد قابل ادیت است
+            await callback.message.edit_text(caption, reply_markup=back_kb, parse_mode="HTML")
+        edited = True
+    except Exception:
+        edited = False
+
+    if not edited:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        try:
+            if photo_id:
+                await callback.message.answer_photo(photo=photo_id, caption=caption, reply_markup=back_kb, parse_mode="HTML")
+            else:
+                await callback.message.answer(caption, reply_markup=back_kb, parse_mode="HTML")
+        except Exception:
+            pass
+
+    await callback.answer()
+
+
+@user_router.callback_query(F.data == "ignore")
+async def cb_ignore_noop(callback: CallbackQuery):
+    await callback.answer()
 
 
 # --- سیستم انتقال آتر (روش‌های درخواستی جدید) ---
@@ -4042,7 +4314,7 @@ async def cmd_force_backup(message: Message):
             await message.bot.send_document(
                 chat_id=BACKUP_CHANNEL_ID,
                 document=FSInputFile(DB_PATH),
-                caption=f"<b>📦 بکاپ دستی دیتابیس (توسط سوپرادمین)</b>\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                caption=f"<b>📦 بکاپ دستی دیتابیس (توسط سوپرادمین)</b>\n⏰ {datetime.now(IRAN_TZ).strftime('%Y-%m-%d %H:%M:%S')} (به وقت ایران)",
                 parse_mode="HTML"
             )
             await message.reply("✅ فایل دیتابیس با موفقیت به کانال تلگرام بکاپ ارسال شد.")
@@ -4330,6 +4602,32 @@ async def cmd_set_bank_rate(message: Message):
     await message.reply(f"✅ نرخ سود روزانه بانک آترامنتوم به <b>{rate}٪</b> تغییر یافت.", parse_mode="HTML")
 
 
+@admin_router.message(Command("set_bank_treasury_profit_pct"))
+async def cmd_set_bank_treasury_profit_pct(message: Message):
+    if not is_private(message) or not is_super_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        return await message.reply(
+            "راهنما: <code>/set_bank_treasury_profit_pct [درصد سهم خزانه]</code>\n"
+            "مثال (۴۵٪ خزانه و ۵۵٪ خلق): <code>/set_bank_treasury_profit_pct 45</code>",
+            parse_mode="HTML"
+        )
+    try:
+        pct = float(args[1])
+        if not (0 <= pct <= 100):
+            raise ValueError
+    except ValueError:
+        return await message.reply("❌ مقدار نامعتبر است. درصد باید بین ۰ تا ۱۰۰ باشد.")
+    await set_setting("bank_treasury_profit_pct", pct)
+    await message.reply(
+        f"✅ نسبت تأمین سود روزانه بانک تغییر یافت.\n"
+        f"🏛 سهم خزانه مرکزی: <b>{pct}٪</b>\n"
+        f"✨ سهم خلق پول: <b>{100 - pct}٪</b>",
+        parse_mode="HTML"
+    )
+
+
 @admin_router.message(Command("set_min_loan"))
 async def cmd_set_min_loan(message: Message):
     if not is_private(message) or not is_super_admin(message.from_user.id):
@@ -4533,7 +4831,7 @@ async def cmd_view_set_all(message: Message):
         "shop_seller_pct", "shop_bank_pct", "shop_burn_pct",
         "courier_pct", "courier_bank_pct", "courier_burn_pct",
         "tier1_pct", "tier2_pct", "tier3_pct",
-        "bank_daily_rate",
+        "bank_daily_rate", "bank_treasury_profit_pct",
         "min_loan_amount", "max_loan_amount",
         "min_loan_interest", "max_loan_interest",
         "allowed_installments",
@@ -4580,6 +4878,14 @@ async def cmd_view_set_all(message: Message):
         f"🔸 نرخ سود روزانه: <code>{pct('bank_daily_rate')}٪</code>\n"
         "📝 کاربرد: نرخ سود روزانه‌ای که به سپرده‌های بانکی کاربران تعلق می‌گیرد.\n"
         "⚙️ تنظیم: <code>/set_bank_rate [درصد]</code>\n\n"
+
+        "🏛 <b>بخش: بانک آترامنتوم — منبع تأمین سود روزانه</b>\n"
+        f"🔸 سهم خزانه مرکزی: <code>{pct('bank_treasury_profit_pct')}٪</code>\n"
+        f"🔸 سهم خلق پول: <code>{100 - float(vals['bank_treasury_profit_pct']):.2f}٪</code>\n"
+        "📝 کاربرد: از هر سود روزانه پرداختی به سپرده‌گذاران، این درصد از خزانه مرکزی کسر و مابقی "
+        "به‌صورت خلق پول تأمین می‌شود؛ در صورت کمبود موجودی خزانه، پرداخت کاربر هرگز کامل حذف "
+        "(توکن‌سوزی) نمی‌شود و باقیِ سهم خزانه که کسر نشده در خود خزانه باقی می‌ماند.\n"
+        "⚙️ تنظیم: <code>/set_bank_treasury_profit_pct [درصد سهم خزانه]</code>\n\n"
 
         "💳 <b>بخش: وام — حداقل/حداکثر مبلغ وام</b>\n"
         f"🔸 حداقل مبلغ وام: <code>₳ {int(float(vals['min_loan_amount']))}</code>\n"
@@ -6287,21 +6593,54 @@ def _bank_detect_panel_type(message: Message) -> str:
         return "panel"
 
 
-async def _bank_render(user_id: int, panel_type: str):
-    """متن و کیبورد صفحه اصلی بانک را بر اساس نوع پنل و موجودی به‌روز کاربر می‌سازد."""
+def _kb_has_callback(reply_markup, target: str) -> bool:
+    """بررسی می‌کند کیبورد فعلی پیام حاوی دکمه‌ای با callback_data مشخص هست یا نه؛ برای تشخیص
+    اینکه کاربر از مسیر پروفایل («🔙 برگشت به پروفایل») وارد بخش بانک/وام شده تا همان دکمه در
+    زیرمنوهای بعدی هم حفظ شود."""
+    try:
+        for row in reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data == target:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _append_prof_back_row(kb):
+    """دکمه «🔙 برگشت به پروفایل» را به‌صورت یک ردیف جدید به کیبورد اضافه می‌کند؛ اگر کیبوردی
+    وجود نداشته باشد، کیبورد جدیدی فقط با همین دکمه ساخته می‌شود."""
+    back_row = [InlineKeyboardButton(text="🔙 برگشت به پروفایل", callback_data="prof_home")]
+    if kb:
+        return InlineKeyboardMarkup(inline_keyboard=kb.inline_keyboard + [back_row])
+    return InlineKeyboardMarkup(inline_keyboard=[back_row])
+
+
+async def _bank_render(user_id: int, panel_type: str, with_back: bool = False):
+    """متن و کیبورد صفحه اصلی بانک را بر اساس نوع پنل و موجودی به‌روز کاربر می‌سازد.
+    در صورت with_back=True، دکمه «🔙 برگشت به پروفایل» به همان ردیف آخر کیبورد اضافه می‌شود
+    (بدون افزودن ردیف جدید) تا منطق تشخیص نوع پنل (_bank_detect_panel_type) دست‌نخورده بماند."""
     u = await get_user_data(user_id)
     if not u:
         return None
     if panel_type == "full":
-        return _bank_full_text(u), _bank_full_buttons()
-    return _bank_panel_text(u), _bank_buttons()
+        text, kb = _bank_full_text(u), _bank_full_buttons()
+    else:
+        text, kb = _bank_panel_text(u), _bank_buttons()
+    if with_back:
+        rows = [list(row) for row in kb.inline_keyboard]
+        rows[-1].append(InlineKeyboardButton(text="🔙 برگشت به پروفایل", callback_data="prof_home"))
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    return text, kb
 
 
-async def _bank_edit_main(bot: Bot, chat_id: int, message_id: int, user_id: int, panel_type: str, note: str = "") -> None:
+async def _bank_edit_main(
+    bot: Bot, chat_id: int, message_id: int, user_id: int, panel_type: str, note: str = "", with_back: bool = False
+) -> None:
     """پیام اصلی بانک را ویرایش کرده و به صفحه اصلی (با موجودی جدید) بازمی‌گرداند."""
     if not message_id:
         return
-    rendered = await _bank_render(user_id, panel_type)
+    rendered = await _bank_render(user_id, panel_type, with_back=with_back)
     if not rendered:
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="❌ حساب شما یافت نشد.")
@@ -6358,6 +6697,7 @@ async def cb_bank_deposit(callback: CallbackQuery, state: FSMContext):
     chat_id = callback.message.chat.id
     message_id = callback.message.message_id
     panel_type = _bank_detect_panel_type(callback.message)
+    from_profile = _kb_has_callback(callback.message.reply_markup, "prof_home")
 
     try:
         await callback.message.edit_text(_bank_deposit_prompt_text(), parse_mode="HTML")
@@ -6366,6 +6706,7 @@ async def cb_bank_deposit(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(
         bank_user=user_id, bank_chat_id=chat_id, bank_msg_id=message_id, bank_panel_type=panel_type,
+        bank_from_profile=from_profile,
     )
     await state.set_state(BankForm.waiting_for_deposit_amount)
     current_state = await state.get_state()
@@ -6374,6 +6715,7 @@ async def cb_bank_deposit(callback: CallbackQuery, state: FSMContext):
         lambda: _bank_edit_main(
             callback.bot, chat_id, message_id, user_id, panel_type,
             note="⏳ عملیات واریز به دلیل عدم دریافت پاسخ در بازه ۱ دقیقه به‌صورت خودکار لغو شد.",
+            with_back=from_profile,
         ),
     )
     await callback.answer()
@@ -6385,6 +6727,7 @@ async def cb_bank_withdraw(callback: CallbackQuery, state: FSMContext):
     chat_id = callback.message.chat.id
     message_id = callback.message.message_id
     panel_type = _bank_detect_panel_type(callback.message)
+    from_profile = _kb_has_callback(callback.message.reply_markup, "prof_home")
 
     try:
         await callback.message.edit_text(_bank_withdraw_prompt_text(), parse_mode="HTML")
@@ -6393,6 +6736,7 @@ async def cb_bank_withdraw(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(
         bank_user=user_id, bank_chat_id=chat_id, bank_msg_id=message_id, bank_panel_type=panel_type,
+        bank_from_profile=from_profile,
     )
     await state.set_state(BankForm.waiting_for_withdraw_amount)
     current_state = await state.get_state()
@@ -6401,6 +6745,7 @@ async def cb_bank_withdraw(callback: CallbackQuery, state: FSMContext):
         lambda: _bank_edit_main(
             callback.bot, chat_id, message_id, user_id, panel_type,
             note="⏳ عملیات برداشت به دلیل عدم دریافت پاسخ در بازه ۱ دقیقه به‌صورت خودکار لغو شد.",
+            with_back=from_profile,
         ),
     )
     await callback.answer()
@@ -6415,6 +6760,7 @@ async def process_bank_deposit(message: Message, state: FSMContext):
     chat_id = data.get("bank_chat_id", message.chat.id)
     bank_msg_id = data.get("bank_msg_id")
     panel_type = data.get("bank_panel_type", "panel")
+    from_profile = data.get("bank_from_profile", False)
 
     if not message.reply_to_message or message.reply_to_message.message_id != bank_msg_id:
         try:
@@ -6431,7 +6777,7 @@ async def process_bank_deposit(message: Message, state: FSMContext):
 
     async def _fail(note_text: str):
         await state.clear()
-        await _bank_edit_main(message.bot, chat_id, bank_msg_id, user_id, panel_type, note=note_text)
+        await _bank_edit_main(message.bot, chat_id, bank_msg_id, user_id, panel_type, note=note_text, with_back=from_profile)
         try:
             await message.delete()
         except Exception:
@@ -6477,6 +6823,7 @@ async def process_bank_deposit(message: Message, state: FSMContext):
     await _bank_edit_main(
         message.bot, chat_id, bank_msg_id, user_id, panel_type,
         note=f"✅ مبلغ <code>₳ {amount}</code> با موفقیت به حساب بانکی شما واریز شد.",
+        with_back=from_profile,
     )
     try:
         await message.delete()
@@ -6493,6 +6840,7 @@ async def process_bank_withdraw(message: Message, state: FSMContext):
     chat_id = data.get("bank_chat_id", message.chat.id)
     bank_msg_id = data.get("bank_msg_id")
     panel_type = data.get("bank_panel_type", "panel")
+    from_profile = data.get("bank_from_profile", False)
 
     if not message.reply_to_message or message.reply_to_message.message_id != bank_msg_id:
         try:
@@ -6509,7 +6857,7 @@ async def process_bank_withdraw(message: Message, state: FSMContext):
 
     async def _fail(note_text: str):
         await state.clear()
-        await _bank_edit_main(message.bot, chat_id, bank_msg_id, user_id, panel_type, note=note_text)
+        await _bank_edit_main(message.bot, chat_id, bank_msg_id, user_id, panel_type, note=note_text, with_back=from_profile)
         try:
             await message.delete()
         except Exception:
@@ -6546,6 +6894,7 @@ async def process_bank_withdraw(message: Message, state: FSMContext):
     await _bank_edit_main(
         message.bot, chat_id, bank_msg_id, user_id, panel_type,
         note=f"✅ مبلغ <code>₳ {amount}</code> با موفقیت از بانک به کیف پول شما برداشت شد.",
+        with_back=from_profile,
     )
     try:
         await message.delete()
@@ -6564,6 +6913,15 @@ async def run_nightly_bank_interest(bot: Bot):
     if rate <= 0:
         return
 
+    # 🏛 نسبت تأمین سود روزانه بانک از خزانه مرکزی؛ باقی‌مانده (خلق پول) بدون کسر از خزانه تأمین می‌شود
+    treasury_pct_raw = await get_setting("bank_treasury_profit_pct")
+    try:
+        treasury_pct = float(treasury_pct_raw)
+        if not (0 <= treasury_pct <= 100):
+            raise ValueError
+    except (TypeError, ValueError):
+        treasury_pct = 45.0
+
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -6578,22 +6936,55 @@ async def run_nightly_bank_interest(bot: Bot):
         if raw_profit <= 0:
             continue
 
-        # قانون توکن‌سوزی: فقط بخشی از سود که باعث عبور سپرده از سقف نمی‌شود پرداخت می‌شود
+        # سقف سپرده‌گذاری: فقط بخشی از سود که باعث عبور سپرده از سقف نمی‌شود پرداخت می‌شود
         allowed_profit = min(raw_profit, max(0, BANK_SAVINGS_CAP - savings))
         if allowed_profit <= 0:
             continue
 
+        # --- 🏛 تفکیک منبع سود روزانه: بخشی از خزانه مرکزی و بخشی به‌صورت خلق پول ---
+        # قانون «بدون توکن‌سوزی»: کل مبلغ allowed_profit همیشه به‌طور کامل به کاربر پرداخت می‌شود.
+        # ابتدا سهم خزانه (treasury_pct٪) تلاش می‌شود از خزانه مرکزی کسر شود؛ اگر موجودی خزانه برای
+        # این سهم کافی نباشد (به‌جای لغو کل پرداخت که معادل توکن‌سوزی سود کاربر بود)، فقط همان مقداری
+        # که واقعاً در خزانه موجود است کسر می‌شود و باقی سهم به‌صورت خلق پول تأمین می‌گردد؛ یعنی هیچ
+        # مبلغی بیش از موجودی واقعی از خزانه کسر نمی‌شود و مابقی موجودی خزانه دست‌نخورده در آن باقی می‌ماند.
+        treasury_share = int(allowed_profit * (treasury_pct / 100.0))
+
         async with db_lock:
             async with aiosqlite.connect(DB_PATH) as db:
-                paid = await treasury_debit(
-                    db, allowed_profit, f"سود روزانه بانک برای کاربر {user_id}", related_user=user_id
-                )
-                if not paid:
-                    logging.warning(
-                        f"⚠️ عدم امکان پرداخت سود روزانه بانک به کاربر {user_id} به دلیل عدم کفایت موجودی خزانه."
+                actual_treasury_debit = 0
+                if treasury_share > 0:
+                    async with db.execute(
+                        "SELECT balance FROM users WHERE user_id = ?", (TREASURY_USER_ID,)
+                    ) as cur_t:
+                        t_row = await cur_t.fetchone()
+                    treasury_balance = t_row[0] if t_row else 0
+                    debit_attempt = min(treasury_share, max(0, treasury_balance))
+                    if debit_attempt > 0:
+                        paid = await treasury_debit(
+                            db, debit_attempt,
+                            f"سهم خزانه از سود روزانه بانک برای کاربر {user_id}",
+                            related_user=user_id,
+                        )
+                        if paid:
+                            actual_treasury_debit = debit_attempt
+
+                # مابقی سود (سهم خزانه‌ای که کسر نشد + سهم خلق‌شده) بدون کسر از خزانه تأمین می‌شود
+                minted_share = allowed_profit - actual_treasury_debit
+                if minted_share > 0:
+                    tx_id = f"MINT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{random.randint(1000, 9999)}"
+                    await db.execute(
+                        "INSERT INTO audit_logs (tx_id, timestamp, from_user, to_user, amount, reason) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            tx_id,
+                            datetime.now(timezone.utc).isoformat(),
+                            0,
+                            user_id,
+                            minted_share,
+                            f"سهم خلق‌شده از سود روزانه بانک برای کاربر {user_id}",
+                        ),
                     )
-                    await db.commit()
-                    continue
+
                 await db.execute(
                     "UPDATE users SET bank_savings = bank_savings + ?, last_daily_profit = ?, "
                     "last_bank_claim = ? WHERE user_id = ?",
@@ -6743,10 +7134,14 @@ async def cmd_loan_start(message: Message, state: FSMContext):
 
 @user_router.callback_query(F.data == "loan_menu")
 async def cb_loan_menu(callback: CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    from_profile = _kb_has_callback(callback.message.reply_markup, "prof_home")
+    kb_rows = [
         [InlineKeyboardButton(text="➕ درخواست وام جدید", callback_data="loan_new_request")],
         [InlineKeyboardButton(text="📋 وام‌های من", callback_data="loan_my_list")],
-    ])
+    ]
+    if from_profile:
+        kb_rows.append([InlineKeyboardButton(text="🔙 برگشت به پروفایل", callback_data="prof_home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     try:
         await callback.message.edit_text("💳 <b>وام‌های آترامنتوم</b>\n\nیکی از گزینه‌های زیر را انتخاب کنید:", reply_markup=kb, parse_mode="HTML")
     except Exception:
@@ -7538,7 +7933,10 @@ async def _build_my_loans_view(user_id: int):
                 ) as cur_i:
                     next_inst = await cur_i.fetchone()
             if next_inst:
-                due = next_inst["due_date"][:10]
+                due_dt = datetime.fromisoformat(next_inst["due_date"])
+                if due_dt.tzinfo is None:
+                    due_dt = due_dt.replace(tzinfo=timezone.utc)
+                due = due_dt.astimezone(IRAN_TZ).strftime('%Y-%m-%d')
                 parts.append(f"   💳 قسط بعدی: <code>₳ {next_inst['amount']}</code> | سررسید: {due}")
                 kb_rows.append([InlineKeyboardButton(
                     text=f"💳 پرداخت قسط #{next_inst['installment_number']} وام #{loan['id']}",
@@ -7565,7 +7963,10 @@ async def cmd_my_loans(message: Message):
 
 @user_router.callback_query(F.data == "loan_my_list")
 async def cb_my_loans_list(callback: CallbackQuery):
+    from_profile = _kb_has_callback(callback.message.reply_markup, "prof_home")
     text, kb = await _build_my_loans_view(callback.from_user.id)
+    if from_profile:
+        kb = _append_prof_back_row(kb)
     try:
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
@@ -7577,6 +7978,7 @@ async def cb_my_loans_list(callback: CallbackQuery):
 async def cb_cancel_loan_request(callback: CallbackQuery):
     loan_id = int(callback.data[len("cancel_loan_req_"):])
     user_id = callback.from_user.id
+    from_profile = _kb_has_callback(callback.message.reply_markup, "prof_home")
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -7604,6 +8006,8 @@ async def cb_cancel_loan_request(callback: CallbackQuery):
             await db.commit()
 
     text, kb = await _build_my_loans_view(user_id)
+    if from_profile:
+        kb = _append_prof_back_row(kb)
     try:
         await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
@@ -7646,8 +8050,9 @@ async def cb_pay_installment(callback: CallbackQuery):
             if due_date.tzinfo is None:
                 due_date = due_date.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) < due_date:
+                due_date_ir = due_date.astimezone(IRAN_TZ)
                 return await callback.answer(
-                    f"⏳ سررسید این قسط هنوز نرسیده است. تاریخ سررسید: {due_date.strftime('%Y-%m-%d')}",
+                    f"⏳ سررسید این قسط هنوز نرسیده است. تاریخ سررسید: {due_date_ir.strftime('%Y-%m-%d')}",
                     show_alert=True,
                 )
 
@@ -8060,24 +8465,10 @@ async def loan_management_loop(bot: Bot):
 # --- راهنمای دستورات ---
 
 
-@user_router.message(Command("help"))
-@user_router.message(F.text == "راهنمای جامع بانک")
-async def cmd_help(message: Message):
-    user_id = message.from_user.id
-    is_sa = is_super_admin(user_id)
-    u = await get_user_data(user_id)
-    is_adm = u and u["is_admin"]
-
-    has_approved_shop = False
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT 1 FROM shops WHERE owner_id = ? AND status = 'APPROVED' LIMIT 1", (user_id,)
-        ) as cur:
-            has_approved_shop = (await cur.fetchone()) is not None
-        async with db.execute("SELECT 1 FROM couriers WHERE user_id = ?", (user_id,)) as cur_c:
-            is_courier = (await cur_c.fetchone()) is not None or is_super_admin(user_id)
-
+async def _build_help_text(user_id: int, group_only: bool = False) -> str:
+    """متن راهنما را می‌سازد. در حالت group_only=True فقط لیست دستورات عمومی (بدون درنظرگرفتن
+    سطح دسترسی یا ادمین بودن کاربر) بازگردانده می‌شود؛ در غیر این صورت راهنمای کامل و شخصی‌سازی‌شده
+    بر اساس نقش واقعی کاربر (فروشگاه تأییدشده، پستچی، ادمین، سوپرادمین) ساخته می‌شود."""
     txt = (
         "📱 <b>راهنمای دستورات کاربران:</b>\n"
         "🔹 <code>/start</code> - شروع و دریافت شماره حساب\n"
@@ -8103,6 +8494,26 @@ async def cmd_help(message: Message):
         "🔹 <code>/request_shop</code> - ارسال درخواست ثبت فروشگاه\n"
         "🔹 <code>/add_product</code> - ثبت محصول جديد با عکس و مشخصات\n"
     )
+
+    if group_only:
+        # لیست دستورات عمومی: بدون درنظرگرفتن سطح دسترسی یا ادمین بودن کاربر
+        txt += "\n"
+        return txt
+
+    is_sa = is_super_admin(user_id)
+    u = await get_user_data(user_id)
+    is_adm = u and u["is_admin"]
+
+    has_approved_shop = False
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT 1 FROM shops WHERE owner_id = ? AND status = 'APPROVED' LIMIT 1", (user_id,)
+        ) as cur:
+            has_approved_shop = (await cur.fetchone()) is not None
+        async with db.execute("SELECT 1 FROM couriers WHERE user_id = ?", (user_id,)) as cur_c:
+            is_courier = (await cur_c.fetchone()) is not None or is_super_admin(user_id)
+
     if has_approved_shop:
         txt += (
             "🔹 <code>/inventory</code> - مدیریت موجودی انبار\n"
@@ -8168,6 +8579,13 @@ async def cmd_help(message: Message):
             "🔸 <code>/reset_all</code> - ریست کامل سیستم (پاک‌سازی تمام داده‌ها به‌جز تنظیمات مدیریتی)\n"
         )
 
+    return txt
+
+
+@user_router.message(Command("help"))
+@user_router.message(F.text == "راهنمای جامع بانک")
+async def cmd_help(message: Message):
+    txt = await _build_help_text(message.from_user.id, group_only=False)
     await message.reply(txt, parse_mode="HTML")
 
 
